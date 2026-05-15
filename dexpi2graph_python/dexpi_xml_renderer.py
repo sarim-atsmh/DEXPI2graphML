@@ -40,6 +40,7 @@ PROTEUS_SYMBOL_ALIASES = {
     "check_valve_with_flange": "check_valve_with_flange",
     "flanged_joint": "blind_flange",
     "flangedjoint": "blind_flange",
+    "arrow_head_2": "arrow_head",
 }
 
 
@@ -85,9 +86,11 @@ def render_dexpi_plot(path_xml: str, path_graph: str, path_plot_stem: str) -> No
 
     if _is_proteusxml_root(root):
         _render_proteusxml(root, stem)
+        _render_proteusxml(root, Path(f"{stem}.block"), use_block_names=True)
         return
     if _is_xmplant_bbox_root(root):
         _render_xmplant_bbox(root, stem)
+        _render_xmplant_bbox(root, Path(f"{stem}.block"), use_block_names=True)
         return
     if _is_graphical_dexpi_root(root):
         _render_graphical_dexpi(root, stem)
@@ -171,7 +174,7 @@ def _render_graphical_dexpi(root, output_stem: Path) -> None:
     _finalize_figure(figure, axis, output_stem)
 
 
-def _render_proteusxml(root, output_stem: Path) -> None:
+def _render_proteusxml(root, output_stem: Path, use_block_names: bool = False) -> None:
     view_box = _extract_proteus_view_box(root)
     pixel_scale = _pixel_scale(view_box)
     figure, axis = _build_figure(view_box, pixel_scale)
@@ -189,12 +192,12 @@ def _render_proteusxml(root, output_stem: Path) -> None:
         _draw_proteus_segment(axis, segment, view_box, pixel_scale, bbox_map, port_map)
 
     for component in components.values():
-        _draw_proteus_component(axis, component, view_box, pixel_scale)
+        _draw_proteus_component(axis, component, view_box, pixel_scale, use_block_names)
 
     _finalize_figure(figure, axis, output_stem)
 
 
-def _render_xmplant_bbox(root, output_stem: Path) -> None:
+def _render_xmplant_bbox(root, output_stem: Path, use_block_names: bool = False) -> None:
     view_box = _extract_xmplant_view_box(root)
     pixel_scale = _pixel_scale(view_box)
     figure, axis = _build_figure(view_box, pixel_scale)
@@ -211,7 +214,7 @@ def _render_xmplant_bbox(root, output_stem: Path) -> None:
         _draw_xmplant_segment(axis, segment, bbox_map)
 
     for component in components.values():
-        _draw_xmplant_component(axis, component, view_box, pixel_scale)
+        _draw_xmplant_component(axis, component, view_box, pixel_scale, use_block_names)
 
     _finalize_figure(figure, axis, output_stem)
 
@@ -582,7 +585,7 @@ def _resolve_port_anchor(
     return (target_x, target_y)
 
 
-def _draw_proteus_component(axis, component, view_box: ViewBox, pixel_scale: float) -> None:
+def _draw_proteus_component(axis, component, view_box: ViewBox, pixel_scale: float, use_block_names: bool = False) -> None:
     position = _find_child_local(component, "Position")
     bbox_element = _find_child_local(component, "GraphicBounds")
     if position is None and bbox_element is None:
@@ -599,12 +602,12 @@ def _draw_proteus_component(axis, component, view_box: ViewBox, pixel_scale: flo
     else:
         drawn_bbox = _draw_rotated_bbox_fallback(axis, bbox, rotation)
 
-    labels = _proteus_labels(component)
+    labels = _proteus_block_name_labels(component) if use_block_names else _proteus_labels(component)
     if labels:
         _draw_component_label(axis, drawn_bbox, labels)
 
 
-def _draw_xmplant_component(axis, component, view_box: ViewBox, pixel_scale: float) -> None:
+def _draw_xmplant_component(axis, component, view_box: ViewBox, pixel_scale: float, use_block_names: bool = False) -> None:
     bbox = _bbox_from_xmplant_component(component, view_box, pixel_scale)
     center_x = (bbox.left + bbox.right) / 2.0
     center_y = (bbox.top + bbox.bottom) / 2.0
@@ -616,7 +619,7 @@ def _draw_xmplant_component(axis, component, view_box: ViewBox, pixel_scale: flo
     else:
         drawn_bbox = _draw_rotated_bbox_fallback(axis, bbox, rotation)
 
-    labels = _xmplant_labels(component)
+    labels = _xmplant_block_name_labels(component) if use_block_names else _xmplant_labels(component)
     if labels:
         _draw_component_label(axis, drawn_bbox, labels)
 
@@ -830,6 +833,16 @@ def _xmplant_labels(component) -> list[str]:
     if short_tag and short_tag not in labels:
         labels.append(short_tag)
     return labels
+
+
+def _proteus_block_name_labels(component) -> list[str]:
+    block = (component.get("blockName") or "").strip()
+    return [block] if block else []
+
+
+def _xmplant_block_name_labels(component) -> list[str]:
+    block = _xmplant_generic_attribute(component, "DXF_BLOCK_NAME").strip()
+    return [block] if block else []
 
 
 def _proteus_generic_attribute(component, name: str) -> str:
