@@ -79,7 +79,12 @@ class Transform:
         return (self.tx + rx, self.ty + ry)
 
 
-def render_dexpi_plot(path_xml: str, path_graph: str, path_plot_stem: str) -> None:
+def render_dexpi_plot(
+    path_xml: str,
+    path_graph: str,
+    path_plot_stem: str,
+    include_xmplant: bool = False,
+) -> None:
     xml_path = Path(path_xml)
     stem = _normalized_output_stem(path_plot_stem)
     root = ET.parse(xml_path).getroot()
@@ -89,6 +94,8 @@ def render_dexpi_plot(path_xml: str, path_graph: str, path_plot_stem: str) -> No
         _render_proteusxml(root, Path(f"{stem}.block"), use_block_names=True)
         return
     if _is_xmplant_bbox_root(root):
+        if not include_xmplant:
+            return
         _render_xmplant_bbox(root, stem)
         _render_xmplant_bbox(root, Path(f"{stem}.block"), use_block_names=True)
         return
@@ -198,7 +205,15 @@ def _render_proteusxml(root, output_stem: Path, use_block_names: bool = False) -
             _proteus_generic_attribute(comp, "SOURCE_SYMBOL_RAW"),
         ]):
             pos = _find_child_local(comp, "Position")
-            arrowhead_rotations[cid] = -_float_attr(pos, "rotation") if pos is not None else 0.0
+            bbox_elem = _find_child_local(comp, "GraphicBounds")
+            if pos is not None and bbox_elem is not None:
+                arrowhead_rotations[cid] = _infer_arrow_canvas_rotation(
+                    _float_attr(pos, "x"), _float_attr(pos, "y"),
+                    _float_attr(bbox_elem, "min_x"), _float_attr(bbox_elem, "max_x"),
+                    _float_attr(bbox_elem, "min_y"), _float_attr(bbox_elem, "max_y"),
+                )
+            elif pos is not None:
+                arrowhead_rotations[cid] = -_float_attr(pos, "rotation")
 
     for segment in _iter_local(root, "PipeSegment"):
         _draw_proteus_segment(axis, segment, view_box, pixel_scale, bbox_map, port_map, arrowhead_rotations)
@@ -231,7 +246,23 @@ def _render_xmplant_bbox(root, output_stem: Path, use_block_names: bool = False)
             _xmplant_generic_attribute(comp, "DXF_BLOCK_NAME"),
             _xmplant_generic_attribute(comp, "SUB_CLASS"),
         ]):
-            arrowhead_rotations[cid] = -_xmplant_rotation(comp)
+            _src2 = _normalize_key(_xmplant_generic_attribute(comp, "SOURCE_SYMBOL"))
+            _ext2 = _find_child_local(comp, "Extent") if _src2 == "arrow_head" else None
+            if _ext2 is not None:
+                _mn2 = _find_child_local(_ext2, "Min")
+                _mx2 = _find_child_local(_ext2, "Max")
+                _ox2 = _xmplant_generic_attribute(comp, "ORIGINAL_DXF_X")
+                _oy2 = _xmplant_generic_attribute(comp, "ORIGINAL_DXF_Y")
+                if _mn2 is not None and _mx2 is not None and _ox2 and _oy2:
+                    arrowhead_rotations[cid] = _infer_arrow_canvas_rotation(
+                        float(_ox2), float(_oy2),
+                        _float_attr(_mn2, "X"), _float_attr(_mx2, "X"),
+                        _float_attr(_mn2, "Y"), _float_attr(_mx2, "Y"),
+                    )
+                else:
+                    arrowhead_rotations[cid] = -_xmplant_rotation(comp)
+            else:
+                arrowhead_rotations[cid] = -_xmplant_rotation(comp)
 
     for segment in _iter_local(root, "PipingNetworkSegment"):
         _draw_xmplant_segment(axis, segment, bbox_map, arrowhead_rotations)
@@ -340,14 +371,8 @@ def _extract_xmplant_view_box(root) -> ViewBox:
                     _float_attr(max_node, "X"),
                     _float_attr(max_node, "Y"),
                 ))
-        else:
-            pos = _find_child_local(comp, "Position")
-            if pos is not None:
-                loc = _find_child_local(pos, "Location")
-                if loc is not None:
-                    x = _float_attr(loc, "X")
-                    y = _float_attr(loc, "Y")
-                    bounds.append((x, y, x, y))
+        # Location is in scaled DXF units (e.g. 227.76) while Extent is in normalized
+        # space — mixing them would produce a huge view box and wrong pixel_scale.
     if bounds:
         min_x = min(item[0] for item in bounds)
         min_y = min(item[1] for item in bounds)
@@ -628,10 +653,19 @@ def _draw_proteus_component(axis, component, view_box: ViewBox, pixel_scale: flo
     center_y = (bbox.top + bbox.bottom) / 2.0
     rotation = -_float_attr(position, "rotation") if position is not None else 0.0
 
-    # If the DXF INSERT point is at the far edge of the bbox, the source block's geometry
-    # extended in the opposite direction — a mirror not stored as a rotation angle.
-    # Compare raw XML world coordinates to avoid canvas Y-inversion confusion.
-    if position is not None and bbox_element is not None:
+    _src = _normalize_key(_proteus_generic_attribute(component, "SOURCE_SYMBOL"))
+
+    # Flow arrows: infer direction from TIP position vs bbox rather than trusting
+    # the stored rotation (which varies by source block local orientation).
+    if _src == "arrow_head" and position is not None and bbox_element is not None:
+        rotation = _infer_arrow_canvas_rotation(
+            _float_attr(position, "x"), _float_attr(position, "y"),
+            _float_attr(bbox_element, "min_x"), _float_attr(bbox_element, "max_x"),
+            _float_attr(bbox_element, "min_y"), _float_attr(bbox_element, "max_y"),
+        )
+
+    # Connector-type symbols: INSERT at far edge means geometry was mirrored.
+    if "connector" in _src and position is not None and bbox_element is not None:
         pos_x = _float_attr(position, "x")
         raw_min_x = _float_attr(bbox_element, "min_x")
         raw_max_x = _float_attr(bbox_element, "max_x")
@@ -663,9 +697,25 @@ def _draw_xmplant_component(axis, component, view_box: ViewBox, pixel_scale: flo
     center_y = (bbox.top + bbox.bottom) / 2.0
     rotation = -_xmplant_rotation(component)
 
-    # Detect mirrored geometry: INSERT at far edge of bbox means geometry extended the other way.
-    # ORIGINAL_DXF_X/Y are in the same normalized coordinate space as Extent Min/Max.
-    extent = _find_child_local(component, "Extent")
+    _src = _normalize_key(_xmplant_generic_attribute(component, "SOURCE_SYMBOL"))
+
+    # Flow arrows: infer direction from TIP position (ORIGINAL_DXF_X/Y) vs Extent.
+    # The xmplant converter stores Reference=(1,0) for all arrows regardless of direction.
+    if _src == "arrow_head":
+        _ext = _find_child_local(component, "Extent")
+        if _ext is not None:
+            _mn = _find_child_local(_ext, "Min"); _mx = _find_child_local(_ext, "Max")
+            _ox = _xmplant_generic_attribute(component, "ORIGINAL_DXF_X")
+            _oy = _xmplant_generic_attribute(component, "ORIGINAL_DXF_Y")
+            if _mn is not None and _mx is not None and _ox and _oy:
+                rotation = _infer_arrow_canvas_rotation(
+                    float(_ox), float(_oy),
+                    _float_attr(_mn, "X"), _float_attr(_mx, "X"),
+                    _float_attr(_mn, "Y"), _float_attr(_mx, "Y"),
+                )
+
+    # Connector-type symbols: INSERT at far edge means geometry was mirrored.
+    extent = _find_child_local(component, "Extent") if "connector" in _src else None
     if extent is not None:
         min_node = _find_child_local(extent, "Min")
         max_node = _find_child_local(extent, "Max")
@@ -1065,6 +1115,33 @@ def _arrowhead_anchor(
     d_tip = (tip[0] - target_x) ** 2 + (tip[1] - target_y) ** 2
     d_base = (base[0] - target_x) ** 2 + (base[1] - target_y) ** 2
     return tip if d_tip < d_base else base
+
+
+def _infer_arrow_canvas_rotation(
+    px: float, py: float,
+    xmin: float, xmax: float,
+    ymin: float, ymax: float,
+) -> float:
+    """Return the canvas rotation (degrees) for a flow arrow by finding which bbox
+    edge the TIP (INSERT position px,py) is closest to.
+
+    The DXF INSERT places the arrow TIP at (px, py). The arrow_head.dxf asset has its
+    TIP at min-X (left) in the loaded geometry (the modelspace INSERT has rotation=180°),
+    so canvas_rotation=0 draws pointing LEFT and canvas_rotation=180 draws pointing RIGHT.
+    """
+    w = xmax - xmin
+    h = ymax - ymin
+    rx = (px - xmin) / w if w > 1e-9 else 0.5
+    ry = (py - ymin) / h if h > 1e-9 else 0.5
+    # Score each edge by how close the TIP is to it (1.0 = exactly on that edge).
+    # Asset at rot=0→LEFT, rot=180→RIGHT, rot=90→UP, rot=-90→DOWN (canvas Y-down).
+    candidates = [
+        (rx,       180.0), # TIP near right edge  → RIGHT (needs 180°)
+        (1.0 - rx,   0.0), # TIP near left edge   → LEFT  (needs 0°)
+        (ry,        90.0), # TIP near world max_y → UP    (needs 90°, canvas Y inverted)
+        (1.0 - ry, -90.0), # TIP near world min_y → DOWN  (needs -90°)
+    ]
+    return max(candidates, key=lambda c: c[0])[1]
 
 
 def _resolve_arrowhead_anchor(
