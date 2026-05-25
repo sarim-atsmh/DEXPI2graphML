@@ -107,8 +107,9 @@ while True:
     list_elem.update(list_plot_files())
     if event == "Convert":
         window["status_text"].update(
-            value="Working...", text_color="yellow", background_color="black"
+            value="Checking...", text_color="yellow", background_color="black"
         )
+        window.refresh()
         dexpi_path = values["path_dexpi"]
 
         if dexpi_path == "":
@@ -117,6 +118,10 @@ while True:
                 value="Ready...", text_color="green", background_color="white"
             )
         else:
+            window["status_text"].update(
+            value="Working...", text_color="yellow", background_color="black"
+        )
+            window.refresh()
             dexpi_root = Path(dexpi_path)
             save_path(dexpi_path)
             window["browse_btn"].InitialFolder = dexpi_path
@@ -201,6 +206,6 @@ while True:
                 print("\n")
 
     # See if user wants to quit or window was closed
-    if event == psg.WINDOW_CLOSED:
+    if event == psg.WIN_CLOSED:
         break
     # Output a message to the window

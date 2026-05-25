@@ -21,7 +21,7 @@ from dxf_renderer import (
 TEXT_DISTANCE_FROM_PIPE = 10
 SMALL_MODEL_SCALE = 5000.0
 DEFAULT_DPI = 100
-STUB_LENGTH_PX = 5.0
+STUB_LENGTH_PX = 12.0
 MIN_RENDER_SIZE = 1e-6
 MIN_SYMBOL_PX = 24.0
 GRAPHICAL_TAGS = {
@@ -296,8 +296,9 @@ def _render_xmplant_bbox(
             else:
                 arrowhead_rotations[cid] = -_xmplant_rotation(comp)
 
+    port_map = _build_xmplant_port_map(components, view_box, pixel_scale)
     for segment in _iter_local(root, "PipingNetworkSegment"):
-        _draw_xmplant_segment(axis, segment, bbox_map, arrowhead_rotations)
+        _draw_xmplant_segment(axis, segment, bbox_map, arrowhead_rotations, port_map)
 
     for component in components.values():
         _draw_xmplant_component(axis, component, view_box, pixel_scale, use_block_names)
@@ -692,13 +693,7 @@ def _resolve_port_anchor(
             return _resolve_arrowhead_anchor(
                 axis, bbox, arrowhead_rotation, target_x, target_y, style
             )
-        cx = (bbox.left + bbox.right) / 2.0
-        cy = (bbox.top + bbox.bottom) / 2.0
-        dx = target_x - cx
-        dy = target_y - cy
-        if abs(dx) >= abs(dy):
-            return (bbox.right if dx >= 0 else bbox.left, cy)
-        return (cx, bbox.bottom if dy >= 0 else bbox.top)
+        return _bbox_stub_anchor(axis, bbox, target_x, target_y, style)
 
     return (target_x, target_y)
 
@@ -1102,7 +1097,9 @@ def _xmplant_rotation(component) -> float:
     return 0.0
 
 
-def _draw_xmplant_segment(axis, segment, bbox_map, arrowhead_rotations=None) -> None:
+def _draw_xmplant_segment(
+    axis, segment, bbox_map, arrowhead_rotations=None, port_map=None
+) -> None:
     connection = _find_child_local(segment, "Connection")
     if connection is None:
         return
@@ -1128,12 +1125,14 @@ def _draw_xmplant_segment(axis, segment, bbox_map, arrowhead_rotations=None) -> 
     start = (
         _resolve_arrowhead_anchor(axis, from_box, from_rot, to_cx, to_cy, style)
         if from_rot is not None
-        else _bbox_anchor(from_box, to_box)
+        else _resolve_port_anchor(
+            axis, from_id, from_box, to_cx, to_cy, port_map, style
+        )
     )
     end = (
         _resolve_arrowhead_anchor(axis, to_box, to_rot, fr_cx, fr_cy, style)
         if to_rot is not None
-        else _bbox_anchor(to_box, from_box)
+        else _resolve_port_anchor(axis, to_id, to_box, fr_cx, fr_cy, port_map, style)
     )
     points = _orthogonal_route(
         start, end, vertical_first=_arrowhead_arrival_vertical_first(to_rot)
@@ -1166,15 +1165,51 @@ def _draw_xmplant_segment(axis, segment, bbox_map, arrowhead_rotations=None) -> 
 def _build_port_map(components: dict, view_box: ViewBox, pixel_scale: float) -> dict:
     port_map = {}
     for component_id, component in components.items():
-        ports_elem = _find_child_local(component, "Ports")
-        if ports_elem is None:
+        conn_pts = _find_child_local(component, "ConnectionPoints")
+        if conn_pts is None:
             port_map[component_id] = []
             continue
         ports = []
-        for port in _find_children_local(ports_elem, "Port"):
-            px = _to_canvas_x(_float_attr(port, "x"), view_box, pixel_scale)
-            py = _to_canvas_y(_float_attr(port, "y"), view_box, pixel_scale)
+        for node in _find_children_local(conn_pts, "Node"):
+            position = _find_child_local(node, "Position")
+            if position is None:
+                continue
+            location = _find_child_local(position, "Location")
+            if location is None:
+                continue
+            px = _to_canvas_x(_float_attr(location, "X"), view_box, pixel_scale)
+            py = _to_canvas_y(_float_attr(location, "Y"), view_box, pixel_scale)
             ports.append((px, py))
+        port_map[component_id] = ports
+    return port_map
+
+
+def _build_xmplant_port_map(
+    components: dict, view_box: ViewBox, pixel_scale: float
+) -> dict:
+    """Read PORT_N_X / PORT_N_Y GenericAttributes from xmplant PipingComponents."""
+    port_map = {}
+    for component_id, component in components.items():
+        count_str = _xmplant_generic_attribute(component, "PORT_COUNT")
+        if not count_str:
+            port_map[component_id] = []
+            continue
+        try:
+            count = int(count_str)
+        except ValueError:
+            port_map[component_id] = []
+            continue
+        ports = []
+        for n in range(1, count + 1):
+            x_str = _xmplant_generic_attribute(component, f"PORT_{n}_X")
+            y_str = _xmplant_generic_attribute(component, f"PORT_{n}_Y")
+            if x_str and y_str:
+                try:
+                    px = _to_canvas_x(float(x_str), view_box, pixel_scale)
+                    py = _to_canvas_y(float(y_str), view_box, pixel_scale)
+                    ports.append((px, py))
+                except ValueError:
+                    pass
         port_map[component_id] = ports
     return port_map
 
@@ -1191,11 +1226,10 @@ def _stub_endpoint(port_x: float, port_y: float, bbox: BBox) -> tuple[float, flo
     dx = port_x - cx
     dy = port_y - cy
     dist = math.sqrt(dx * dx + dy * dy)
+    max_dim = max(bbox.width, bbox.height)
+    length = max(STUB_LENGTH_PX, max_dim * 0.5)
     if dist < 1e-9:
-        return port_x + STUB_LENGTH_PX, port_y
-    # Use max(STUB_LENGTH_PX, 30% of component half-size) so stubs are visible on larger symbols
-    component_half = max(bbox.width, bbox.height) / 2.0
-    length = max(STUB_LENGTH_PX, component_half * 0.3)
+        return port_x + length, port_y
     return port_x + dx / dist * length, port_y + dy / dist * length
 
 
@@ -1281,7 +1315,7 @@ def _resolve_arrowhead_anchor(
         face = base
         stub_dir = (-cos_a, -sin_a)
 
-    stub_len = max(STUB_LENGTH_PX, max(bbox.width, bbox.height) * 0.3)
+    stub_len = max(STUB_LENGTH_PX, max(bbox.width, bbox.height) * 0.5)
     stub_end = (face[0] + stub_dir[0] * stub_len, face[1] + stub_dir[1] * stub_len)
 
     axis.plot(
@@ -1315,6 +1349,35 @@ def _bbox_anchor(box: BBox, other: BBox) -> tuple[float, float]:
     if abs(dx) >= abs(dy):
         return (box.right, cy) if dx >= 0 else (box.left, cy)
     return (cx, box.bottom) if dy >= 0 else (cx, box.top)
+
+
+def _bbox_stub_anchor(
+    axis, box: BBox, target_x: float, target_y: float, style: dict
+) -> tuple[float, float]:
+    """Compute bbox-edge face toward target, draw a stub extending outward, return stub tip."""
+    cx = (box.left + box.right) / 2.0
+    cy = (box.top + box.bottom) / 2.0
+    dx = target_x - cx
+    dy = target_y - cy
+    if abs(dx) >= abs(dy):
+        face = (box.right if dx >= 0 else box.left, cy)
+    else:
+        face = (cx, box.bottom if dy >= 0 else box.top)
+    dist = math.sqrt(dx * dx + dy * dy)
+    if dist < 1e-9:
+        return face
+    stub_len = max(STUB_LENGTH_PX, max(box.width, box.height) * 0.5)
+    tip = (face[0] + dx / dist * stub_len, face[1] + dy / dist * stub_len)
+    axis.plot(
+        [face[0], tip[0]],
+        [face[1], tip[1]],
+        color=style["color"],
+        linewidth=style["linewidth"],
+        linestyle="-",
+        solid_capstyle="round",
+        zorder=2,
+    )
+    return tip
 
 
 def _orthogonal_route(
