@@ -609,27 +609,35 @@ def _draw_proteus_segment(
     start_rot = _ar.get(start_id)
     end_rot = _ar.get(end_id)
 
-    # Use the opposite endpoint as the "facing" reference so we pick the correct port
-    start_point = _resolve_port_anchor(
-        axis,
-        start_id,
-        start_box,
-        seg_ex,
-        seg_ey,
-        port_map,
-        style,
-        arrowhead_rotation=start_rot,
-    )
-    end_point = _resolve_port_anchor(
-        axis,
-        end_id,
-        end_box,
-        seg_sx,
-        seg_sy,
-        port_map,
-        style,
-        arrowhead_rotation=end_rot,
-    )
+    # Use the opposite endpoint as the "facing" reference so we pick the correct port.
+    # Skip stub (T-junction) when the pipe endpoint lands outside the component bbox.
+    if start_box is not None and _is_t_junction(seg_sx, seg_sy, start_box):
+        start_point = (seg_sx, seg_sy)
+    else:
+        start_point = _resolve_port_anchor(
+            axis,
+            start_id,
+            start_box,
+            seg_ex,
+            seg_ey,
+            port_map,
+            style,
+            arrowhead_rotation=start_rot,
+        )
+
+    if end_box is not None and _is_t_junction(seg_ex, seg_ey, end_box):
+        end_point = (seg_ex, seg_ey)
+    else:
+        end_point = _resolve_port_anchor(
+            axis,
+            end_id,
+            end_box,
+            seg_sx,
+            seg_sy,
+            port_map,
+            style,
+            arrowhead_rotation=end_rot,
+        )
 
     points = _orthogonal_route(
         start_point,
@@ -1378,6 +1386,15 @@ def _bbox_stub_anchor(
         zorder=2,
     )
     return tip
+
+
+def _is_t_junction(px: float, py: float, bbox: BBox, tol: float = 1.0) -> bool:
+    """True if the pipe endpoint lies outside the component bbox (T-junction onto another pipe)."""
+    left = min(bbox.left, bbox.right) - tol
+    right = max(bbox.left, bbox.right) + tol
+    top = min(bbox.top, bbox.bottom) - tol
+    bottom = max(bbox.top, bbox.bottom) + tol
+    return not (left <= px <= right and top <= py <= bottom)
 
 
 def _orthogonal_route(
