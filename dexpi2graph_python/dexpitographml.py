@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 # import subprocess
@@ -209,3 +210,5 @@ while True:
     if event == psg.WIN_CLOSED:
         break
     # Output a message to the window
+
+sys.exit(0)

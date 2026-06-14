@@ -1370,7 +1370,7 @@ def _bbox_stub_anchor(
     if abs(dx) >= abs(dy):
         face = (box.right if dx >= 0 else box.left, cy)
     else:
-        face = (cx, box.bottom if dy >= 0 else box.top)
+        face = (cx, box.top if dy >= 0 else box.bottom)
     dist = math.sqrt(dx * dx + dy * dy)
     if dist < 1e-9:
         return face
@@ -1634,4 +1634,10 @@ def _asset_name_map():
 
 @lru_cache(maxsize=1)
 def _asset_name_map_cached():
-    return {_normalize_key(path.stem): path.name for path in ASSET_DIR.glob("*.dxf")}
+    # Skip editor/temp artifacts (e.g. "#NAME.dxf"); they are not real assets and
+    # otherwise collide with the real "NAME.dxf" on the normalized lookup key.
+    return {
+        _normalize_key(path.stem): path.name
+        for path in ASSET_DIR.glob("*.dxf")
+        if not path.name.startswith("#")
+    }

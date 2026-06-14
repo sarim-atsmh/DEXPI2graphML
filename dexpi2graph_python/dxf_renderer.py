@@ -531,6 +531,7 @@ def _collect_segments(entity, segments):
         start_angle = float(entity.dxf.start_angle)
         end_angle = float(entity.dxf.end_angle)
         points = _sample_arc(center, radius, start_angle, end_angle)
+        points = _ocs_to_wcs_xy(entity, points, float(entity.dxf.center.z))
         _points_to_segments(points, False, segments)
         return
 
@@ -538,6 +539,7 @@ def _collect_segments(entity, segments):
         center = (float(entity.dxf.center.x), float(entity.dxf.center.y))
         radius = float(entity.dxf.radius)
         points = _sample_arc(center, radius, 0.0, 360.0)
+        points = _ocs_to_wcs_xy(entity, points, float(entity.dxf.center.z))
         _points_to_segments(points, True, segments)
         return
 
@@ -559,6 +561,22 @@ def _collect_segments(entity, segments):
             _points_to_segments(points, False, segments)
         except Exception:
             return
+
+
+def _ocs_to_wcs_xy(entity, points, elevation):
+    """Convert CIRCLE/ARC points sampled in the entity's OCS plane to WCS x/y.
+
+    A mirrored INSERT (negative scale) represents the flip via a negated extrusion
+    vector on circles/arcs, so their stored center is in OCS, not WCS. Reading it raw
+    places mirrored handwheels/circles on the wrong side; to_wcs applies the flip.
+    Identity for the common extrusion (0,0,1).
+    """
+    ocs = entity.ocs()
+    converted = []
+    for x, y in points:
+        wcs = ocs.to_wcs((x, y, elevation))
+        converted.append((float(wcs.x), float(wcs.y)))
+    return converted
 
 
 def _sample_arc(center, radius, start_angle, end_angle, step_degrees: float = 12.0):
