@@ -34,8 +34,9 @@ look up `(instance.tag, instance.ComponentName)`.
   placeholder, don't look it up.
 
 ## 3. The placement transform (the core of the renderer)
-Catalogue geometry is in the symbol's **own local coordinates** (origin `(0,0)` =
-insertion point). Each instance carries:
+Catalogue geometry is in the symbol's **own local coordinates, re-centred so the
+origin `(0,0)` is the symbol's bbox centre** (the exporter does this because each
+instance's `Location` is the placed-bbox centre). Each instance carries:
 
 ```xml
 <Position>

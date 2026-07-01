@@ -1,53 +1,37 @@
+"""Render a DEXPI Proteus 4.2.0 document (``*.dexpi.xml``) to PNG/SVG.
+
+This targets the self-contained Proteus 4.2.0 files produced by
+``dxf_to_dexpi.export.export_proteus_xml`` (see ``DEXPI_VIEWER_GUIDE.md``):
+
+* ``<PlantModel>`` root (no XML namespace),
+* a ``ShapeCatalogue`` of symbol geometry in **local** coordinates,
+* component instances that link to the catalogue by ``(tag, ComponentName)`` and
+  carry their own affine transform (``Position`` + ``Scale``),
+* a ``PipingNetworkSystem`` whose segment ``CenterLine``s are already in world
+  coordinates.
+
+Every instance carries its own transform, so no rotation/scale heuristics are
+needed and no external symbol library is consulted.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, Polygon
+from matplotlib.patches import Circle, Rectangle
 
-from dxf_renderer import (
-    ASSET_DIR,
-    BBox,
-    VisualSpec,
-    draw_visual_spec,
-    render_graph_plot,
-)
-
-TEXT_DISTANCE_FROM_PIPE = 10
-SMALL_MODEL_SCALE = 5000.0
 DEFAULT_DPI = 100
-STUB_LENGTH_PX = 12.0
-MIN_RENDER_SIZE = 1e-6
-MIN_SYMBOL_PX = 24.0
-GRAPHICAL_TAGS = {
-    "Drawing",
-    "ShapeCatalogue",
-    "Presentation",
-    "Position",
-    "Label",
-    "Text",
-    "CenterLine",
-    "PolyLine",
-    "Circle",
-    "PipeFlowArrow",
-    "PipeSlopeSymbol",
-}
-PRIMITIVE_TAGS = {"CenterLine", "PolyLine", "Shape", "Circle", "Ellipse", "Text"}
-PROTEUS_SYMBOL_ALIASES = {
-    "off_page_connector": "inside_plant_sheet_connector",
-    "offpageconnector": "inside_plant_sheet_connector",
-    "inside_plant_sheet_connector": "inside_plant_sheet_connector",
-    "check_valve": "check_valve",
-    "check_valve_with_flange": "check_valve_with_flange",
-    "flanged_joint": "blind_flange",
-    "flangedjoint": "blind_flange",
-    "arrow_head_2": "arrow_head",
-}
+# Drawings are tiny in world units (a sheet is ~0.5 wide); blow them up so the
+# rasterised output has usable resolution. This is the single global scale of
+# §8 — per-instance scale is already baked into each transform.
+SMALL_MODEL_SCALE = 5000.0
+LINE_WIDTH = 0.9
+NOZZLE_RADIUS_PX = 1.6
 
 
 @dataclass(frozen=True)
@@ -59,15 +43,33 @@ class ViewBox:
 
     @property
     def width(self) -> float:
-        return max(self.max_x - self.min_x, 0.1)
+        return self.max_x - self.min_x
 
     @property
     def height(self) -> float:
-        return max(self.max_y - self.min_y, 0.1)
+        return self.max_y - self.min_y
+
+
+@dataclass(frozen=True)
+class BBox:
+    left: float
+    bottom: float
+    right: float
+    top: float
+
+    @property
+    def width(self) -> float:
+        return self.right - self.left
+
+    @property
+    def height(self) -> float:
+        return self.top - self.bottom
 
 
 @dataclass(frozen=True)
 class Transform:
+    """Instance placement transform: scale, then rotate about +Z, then translate."""
+
     tx: float = 0.0
     ty: float = 0.0
     rotation_deg: float = 0.0
@@ -85,32 +87,385 @@ class Transform:
         return (self.tx + rx, self.ty + ry)
 
 
-def render_dexpi_plot(
-    path_xml: str,
-    path_graph: str,
-    path_plot_stem: str,
-    include_xmplant: bool = False,
-) -> None:
-    xml_path = Path(path_xml)
+# Direct children of <PlantModel> that are placed component instances.
+INSTANCE_TAGS = {"PipingComponent", "ProcessInstrumentationFunction", "Equipment"}
+# Geometry primitives that may appear inside a catalogue entry.
+PRIMITIVE_TAGS = {"Line", "PolyLine", "Circle", "Text"}
+
+
+def render_dexpi_plot(path_xml: str, path_plot_stem: str) -> None:
+    """Render ``path_xml`` to ``<path_plot_stem>.png`` and ``.svg``."""
     stem = _normalized_output_stem(path_plot_stem)
-    root = ET.parse(xml_path).getroot()
+    root = ET.parse(Path(path_xml)).getroot()
+    _render_plantmodel(root, stem)
 
-    if _is_proteusxml_root(root):
-        _render_proteusxml(root, stem)
-        _render_proteusxml(root, Path(f"{stem}.block"), use_block_names=True)
+
+def _render_plantmodel(root, output_stem: Path) -> None:
+    view_box = _extract_view_box(root)
+    pixel_scale = _pixel_scale(view_box)
+    figure, axis = _build_figure(view_box, pixel_scale)
+    axis.set_facecolor("white")
+
+    catalogue = _build_component_map(_find_child_local(root, "ShapeCatalogue"))
+
+    # Pipe centerlines sit underneath the symbols.
+    for segment in _iter_segments(root):
+        _draw_centerline(axis, segment, view_box, pixel_scale)
+
+    for instance in _iter_instances(root):
+        component_name = instance.get("ComponentName")
+        definition = (
+            catalogue.get((_local_name(instance.tag), component_name))
+            if component_name
+            else None
+        )
+        if definition is not None:
+            _draw_catalogue_definition(
+                axis,
+                definition,
+                _transform_from_element(instance),
+                view_box,
+                pixel_scale,
+            )
+        else:
+            _draw_placeholder(axis, instance, view_box, pixel_scale)
+
+        for nozzle in _find_children_local(instance, "Nozzle"):
+            _draw_nozzle(axis, nozzle, view_box, pixel_scale)
+
+    _finalize_figure(figure, axis, output_stem)
+
+
+# --------------------------------------------------------------------------- #
+# Catalogue + instances
+# --------------------------------------------------------------------------- #
+def _build_component_map(shape_catalogue) -> dict:
+    """Map ``(element tag, ComponentName)`` -> catalogue entry.
+
+    Keyed by the pair, not ComponentName alone: instances and catalogue entries
+    share tag names and a name can repeat across element types.
+    """
+    component_map: dict = {}
+    if shape_catalogue is None:
+        return component_map
+    for element in list(shape_catalogue):
+        component_name = element.get("ComponentName")
+        if component_name:
+            component_map[(_local_name(element.tag), component_name)] = element
+    return component_map
+
+
+def _iter_instances(root):
+    for element in list(root):
+        if _local_name(element.tag) in INSTANCE_TAGS:
+            yield element
+
+
+def _iter_segments(root):
+    for system in _find_children_local(root, "PipingNetworkSystem"):
+        yield from _find_children_local(system, "PipingNetworkSegment")
+
+
+def _draw_catalogue_definition(
+    axis, definition, transform: Transform, view_box: ViewBox, pixel_scale: float
+) -> None:
+    for child in list(definition):
+        if _local_name(child.tag) in PRIMITIVE_TAGS:
+            _draw_primitive(axis, child, view_box, pixel_scale, transform)
+
+
+def _draw_placeholder(
+    axis, instance, view_box: ViewBox, pixel_scale: float
+) -> None:
+    """Draw a dashed box + label for an instance with no catalogue geometry."""
+    bbox = _instance_bbox(instance, view_box, pixel_scale)
+    if bbox is None:
         return
-    if _is_xmplant_bbox_root(root):
-        if not include_xmplant:
+    axis.add_patch(
+        Rectangle(
+            (bbox.left, bbox.bottom),
+            bbox.width,
+            bbox.height,
+            fill=False,
+            edgecolor="#cc0000",
+            linewidth=LINE_WIDTH,
+            linestyle="--",
+            zorder=3,
+        )
+    )
+    label = instance.get("TagName") or instance.get("ID") or ""
+    if label:
+        _draw_component_label(axis, bbox, [label])
+
+
+# --------------------------------------------------------------------------- #
+# Primitives (local coordinates, transformed per instance)
+# --------------------------------------------------------------------------- #
+def _draw_primitive(
+    axis, primitive, view_box: ViewBox, pixel_scale: float, transform: Transform | None
+) -> None:
+    tag = _local_name(primitive.tag)
+
+    if tag in {"Line", "PolyLine"}:
+        points = _coordinates_from_primitive(primitive, transform)
+        if len(points) < 2:
             return
-        _render_xmplant_bbox(root, stem)
-        _render_xmplant_bbox(root, Path(f"{stem}.block"), use_block_names=True)
+        axis.plot(
+            [_to_canvas_x(x, view_box, pixel_scale) for x, _ in points],
+            [_to_canvas_y(y, view_box, pixel_scale) for _, y in points],
+            color="#000000",
+            linewidth=LINE_WIDTH,
+            solid_capstyle="round",
+            zorder=2,
+        )
         return
-    if _is_graphical_dexpi_root(root):
-        _render_graphical_dexpi(root, stem)
+
+    if tag == "Circle":
+        center = _circle_center(primitive, transform)
+        radius_element = _find_child_local(primitive, "Radius")
+        radius_local = _float_attr(radius_element, "Value") if radius_element is not None else 0.0
+        scale = math.sqrt(abs(transform.sx * transform.sy)) if transform is not None else 1.0
+        axis.add_patch(
+            Circle(
+                _to_canvas(center[0], center[1], view_box, pixel_scale),
+                radius=radius_local * pixel_scale * scale,
+                fill=False,
+                edgecolor="#000000",
+                linewidth=LINE_WIDTH,
+                zorder=3,
+            )
+        )
         return
-    render_graph_plot(path_graph, str(stem))
+
+    if tag == "Text":
+        string = (primitive.text or "").strip()
+        if not string:
+            return
+        x = _float_attr(primitive, "X")
+        y = _float_attr(primitive, "Y")
+        if transform is not None:
+            x, y = transform.apply(x, y)
+        sy = abs(transform.sy) if transform is not None else 1.0
+        rotation = transform.rotation_deg if transform is not None else 0.0
+        axis.text(
+            _to_canvas_x(x, view_box, pixel_scale),
+            _to_canvas_y(y, view_box, pixel_scale),
+            string,
+            fontsize=max(5.0, _float_attr(primitive, "Height", 0.002) * pixel_scale * sy),
+            color="#000000",
+            ha="center",
+            va="center",
+            rotation=-rotation,
+            zorder=4,
+        )
 
 
+def _coordinates_from_primitive(primitive, transform: Transform | None):
+    points = []
+    for coordinate in _find_children_local(primitive, "Coordinate"):
+        x = _float_attr(coordinate, "X")
+        y = _float_attr(coordinate, "Y")
+        if transform is not None:
+            x, y = transform.apply(x, y)
+        points.append((x, y))
+    return points
+
+
+def _circle_center(primitive, transform: Transform | None):
+    location = primitive.find("Position/Location")
+    if location is None:
+        x, y = 0.0, 0.0
+    else:
+        x = _float_attr(location, "X")
+        y = _float_attr(location, "Y")
+    if transform is not None:
+        x, y = transform.apply(x, y)
+    return (x, y)
+
+
+def _transform_from_element(element) -> Transform:
+    position = element.find("Position")
+    scale = element.find("Scale")
+    tx = ty = 0.0
+    rotation_deg = 0.0
+    sx = sy = 1.0
+
+    if position is not None:
+        location = position.find("Location")
+        reference = position.find("Reference")
+        if location is not None:
+            tx = _float_attr(location, "X")
+            ty = _float_attr(location, "Y")
+        if reference is not None:
+            # Reference is a unit vector (cosθ, sinθ); θ is CCW about +Z.
+            rotation_deg = math.degrees(
+                math.atan2(_float_attr(reference, "Y", 0.0), _float_attr(reference, "X", 1.0))
+            )
+    if scale is not None:
+        sx = _float_attr(scale, "X", 1.0)
+        sy = _float_attr(scale, "Y", 1.0)
+
+    return Transform(tx=tx, ty=ty, rotation_deg=rotation_deg, sx=sx, sy=sy)
+
+
+# --------------------------------------------------------------------------- #
+# Pipe network + nozzles (already in world coordinates)
+# --------------------------------------------------------------------------- #
+def _draw_centerline(axis, segment, view_box: ViewBox, pixel_scale: float) -> None:
+    center_line = _find_child_local(segment, "CenterLine")
+    if center_line is None:
+        return
+    points = _coordinates_from_primitive(center_line, None)
+    if len(points) < 2:
+        return
+    axis.plot(
+        [_to_canvas_x(x, view_box, pixel_scale) for x, _ in points],
+        [_to_canvas_y(y, view_box, pixel_scale) for _, y in points],
+        color="#000000",
+        linewidth=LINE_WIDTH,
+        solid_capstyle="round",
+        zorder=1,
+    )
+
+
+def _draw_nozzle(axis, nozzle, view_box: ViewBox, pixel_scale: float) -> None:
+    location = nozzle.find("Position/Location")
+    if location is None:
+        return
+    axis.add_patch(
+        Circle(
+            _to_canvas(
+                _float_attr(location, "X"),
+                _float_attr(location, "Y"),
+                view_box,
+                pixel_scale,
+            ),
+            radius=NOZZLE_RADIUS_PX,
+            fill=True,
+            facecolor="#000000",
+            edgecolor="none",
+            zorder=5,
+        )
+    )
+
+
+def _instance_bbox(instance, view_box: ViewBox, pixel_scale: float) -> BBox | None:
+    """Instance ``Extent`` (world coords) mapped to canvas space."""
+    extent = _find_child_local(instance, "Extent")
+    if extent is None:
+        return None
+    min_node = _find_child_local(extent, "Min")
+    max_node = _find_child_local(extent, "Max")
+    if min_node is None or max_node is None:
+        return None
+    xs = [
+        _to_canvas_x(_float_attr(min_node, "X"), view_box, pixel_scale),
+        _to_canvas_x(_float_attr(max_node, "X"), view_box, pixel_scale),
+    ]
+    ys = [
+        _to_canvas_y(_float_attr(min_node, "Y"), view_box, pixel_scale),
+        _to_canvas_y(_float_attr(max_node, "Y"), view_box, pixel_scale),
+    ]
+    return BBox(left=min(xs), bottom=min(ys), right=max(xs), top=max(ys))
+
+
+def _draw_component_label(axis, bbox: BBox, labels: list[str]) -> None:
+    axis.text(
+        bbox.right + 4.0,
+        (bbox.top + bbox.bottom) / 2.0,
+        "\n".join(labels[:3]),
+        fontsize=8,
+        color="#111111",
+        ha="left",
+        va="center",
+        zorder=5,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# View box, figure, canvas mapping
+# --------------------------------------------------------------------------- #
+def _extract_view_box(root) -> ViewBox:
+    extent = root.find("Drawing/Extent")
+    if extent is not None:
+        min_node = extent.find("Min")
+        max_node = extent.find("Max")
+        if min_node is not None and max_node is not None:
+            return ViewBox(
+                _float_attr(min_node, "X"),
+                _float_attr(min_node, "Y"),
+                _float_attr(max_node, "X"),
+                _float_attr(max_node, "Y"),
+            )
+
+    # Fallback: bound everything we would draw (world-coord coordinates only).
+    coords = []
+    for instance in _iter_instances(root):
+        bbox_extent = _find_child_local(instance, "Extent")
+        if bbox_extent is None:
+            continue
+        for corner in ("Min", "Max"):
+            node = _find_child_local(bbox_extent, corner)
+            if node is not None:
+                coords.append((_float_attr(node, "X"), _float_attr(node, "Y")))
+    if not coords:
+        return ViewBox(0.0, 0.0, 1.0, 1.0)
+    xs = [c[0] for c in coords]
+    ys = [c[1] for c in coords]
+    return ViewBox(min(xs), min(ys), max(xs), max(ys))
+
+
+def _pixel_scale(view_box: ViewBox) -> float:
+    if view_box.width <= 10.0 and view_box.height <= 10.0:
+        return SMALL_MODEL_SCALE
+    return 1.0
+
+
+def _build_figure(view_box: ViewBox, pixel_scale: float):
+    width_px = view_box.width * pixel_scale
+    height_px = view_box.height * pixel_scale
+    figure = plt.figure(
+        figsize=(max(8.0, width_px / DEFAULT_DPI), max(6.0, height_px / DEFAULT_DPI)),
+        dpi=DEFAULT_DPI,
+    )
+    axis = figure.add_subplot(111)
+    axis.set_xlim(0, width_px)
+    axis.set_ylim(height_px, 0)  # flip Y once: screen Y is down
+    return figure, axis
+
+
+def _finalize_figure(figure, axis, output_stem: Path) -> None:
+    axis.set_aspect("equal")
+    axis.axis("off")
+    with mpl.rc_context({"svg.fonttype": "none"}):
+        for extension in (".png", ".svg"):
+            figure.savefig(
+                _output_file(output_stem, extension),
+                dpi=DEFAULT_DPI,
+                bbox_inches="tight",
+                pad_inches=0.02,
+            )
+    plt.close(figure)
+
+
+def _to_canvas(x: float, y: float, view_box: ViewBox, pixel_scale: float):
+    return (
+        _to_canvas_x(x, view_box, pixel_scale),
+        _to_canvas_y(y, view_box, pixel_scale),
+    )
+
+
+def _to_canvas_x(x: float, view_box: ViewBox, pixel_scale: float) -> float:
+    return (x - view_box.min_x) * pixel_scale
+
+
+def _to_canvas_y(y: float, view_box: ViewBox, pixel_scale: float) -> float:
+    return (view_box.max_y - y) * pixel_scale
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers
+# --------------------------------------------------------------------------- #
 def _normalized_output_stem(path_plot_stem: str) -> Path:
     path = Path(path_plot_stem)
     if path.suffix.lower() in {".png", ".svg"}:
@@ -123,1463 +478,22 @@ def _output_file(stem: Path, extension: str) -> Path:
     return Path(f"{stem}{extension}")
 
 
-def _is_proteusxml_root(root) -> bool:
-    return _local_name(root.tag) == "ProteusXML" and any(
-        _local_name(elem.tag) == "Component" for elem in root.iter()
-    )
-
-
-def _is_graphical_dexpi_root(root) -> bool:
-    if _is_proteusxml_root(root):
-        return False
-    if _is_xmplant_bbox_root(root):
-        return False
-    available = {_local_name(elem.tag) for elem in root.iter()}
-    hits = sum(1 for tag in GRAPHICAL_TAGS if tag in available)
-    return hits >= 4 and "Extent" in available
-
-
-def _is_xmplant_bbox_root(root) -> bool:
-    if _local_name(root.tag) != "PlantModel":
-        return False
-    tags = {_local_name(elem.tag) for elem in root.iter()}
-    return (
-        "PipingComponent" in tags
-        and "PipingNetworkSegment" in tags
-        and "GenericAttribute" in tags
-        and "Position" in tags
-        and "Extent" in tags
-    )
-
-
-def _render_graphical_dexpi(root, output_stem: Path) -> None:
-    view_box = _extract_view_box(root)
-    pixel_scale = _pixel_scale(view_box)
-    figure, axis = _build_figure(view_box, pixel_scale)
-    axis.set_facecolor("white")
-    shape_catalogue = root.find(".//ShapeCatalogue")
-    component_map = _build_component_map(shape_catalogue)
-
-    background = root.find(".//Drawing/Presentation")
-    if background is not None:
-        axis.set_facecolor(_color_from_presentation(background))
-
-    for element in _iter_render_elements(root):
-        definition = component_map.get(element.get("ComponentName", ""))
-        if definition is not None and element is not definition:
-            _draw_catalogue_definition(
-                axis,
-                definition,
-                _transform_from_element(element),
-                view_box,
-                pixel_scale,
-            )
-        for child in list(element):
-            if child.tag in PRIMITIVE_TAGS:
-                _draw_primitive(
-                    axis,
-                    child,
-                    view_box,
-                    pixel_scale,
-                    transform=None,
-                )
-
-    _finalize_figure(figure, axis, output_stem)
-
-
-def _render_proteusxml(root, output_stem: Path, use_block_names: bool = False) -> None:
-    view_box = _extract_proteus_view_box(root)
-    pixel_scale = _pixel_scale(view_box)
-    figure, axis = _build_figure(view_box, pixel_scale)
-    axis.set_facecolor("white")
-
-    components = {
-        component.get("id", ""): component
-        for component in _iter_local(root, "Component")
-    }
-    bbox_map = {
-        component_id: _bbox_from_proteus_element(component, view_box, pixel_scale)
-        for component_id, component in components.items()
-        if component_id
-    }
-    port_map = _build_port_map(components, view_box, pixel_scale)
-    arrowhead_rotations: dict = {}
-    for cid, comp in components.items():
-        if _component_is_arrowhead(
-            [
-                comp.get("blockName", ""),
-                comp.get("componentName", ""),
-                comp.get("componentClass", ""),
-                comp.get("componentSubType", ""),
-                _proteus_generic_attribute(comp, "SOURCE_SYMBOL"),
-                _proteus_generic_attribute(comp, "SOURCE_SYMBOL_RAW"),
-            ]
-        ):
-            pos = _find_child_local(comp, "Position")
-            bbox_elem = _find_child_local(comp, "GraphicBounds")
-            if pos is not None and bbox_elem is not None:
-                arrowhead_rotations[cid] = _infer_arrow_canvas_rotation(
-                    _float_attr(pos, "x"),
-                    _float_attr(pos, "y"),
-                    _float_attr(bbox_elem, "min_x"),
-                    _float_attr(bbox_elem, "max_x"),
-                    _float_attr(bbox_elem, "min_y"),
-                    _float_attr(bbox_elem, "max_y"),
-                )
-            elif pos is not None:
-                arrowhead_rotations[cid] = -_float_attr(pos, "rotation")
-
-    for segment in _iter_local(root, "PipeSegment"):
-        _draw_proteus_segment(
-            axis,
-            segment,
-            view_box,
-            pixel_scale,
-            bbox_map,
-            port_map,
-            arrowhead_rotations,
-        )
-
-    for component in components.values():
-        _draw_proteus_component(axis, component, view_box, pixel_scale, use_block_names)
-
-    _finalize_figure(figure, axis, output_stem)
-
-
-def _render_xmplant_bbox(
-    root, output_stem: Path, use_block_names: bool = False
-) -> None:
-    view_box = _extract_xmplant_view_box(root)
-    pixel_scale = _pixel_scale(view_box)
-    figure, axis = _build_figure(view_box, pixel_scale)
-    axis.set_facecolor("white")
-
-    components = {
-        component.get("ID", ""): component
-        for component in _iter_local(root, "PipingComponent")
-    }
-    bbox_map = {
-        component_id: _bbox_from_xmplant_component(component, view_box, pixel_scale)
-        for component_id, component in components.items()
-        if component_id
-    }
-    arrowhead_rotations: dict = {}
-    for cid, comp in components.items():
-        if _component_is_arrowhead(
-            [
-                comp.get("ComponentName", ""),
-                comp.get("ComponentClass", ""),
-                _xmplant_generic_attribute(comp, "SOURCE_SYMBOL"),
-                _xmplant_generic_attribute(comp, "SOURCE_SYMBOL_RAW"),
-                _xmplant_generic_attribute(comp, "DXF_BLOCK_NAME"),
-                _xmplant_generic_attribute(comp, "SUB_CLASS"),
-            ]
-        ):
-            _src2 = _normalize_key(_xmplant_generic_attribute(comp, "SOURCE_SYMBOL"))
-            _ext2 = _find_child_local(comp, "Extent") if _src2 == "arrow_head" else None
-            if _ext2 is not None:
-                _mn2 = _find_child_local(_ext2, "Min")
-                _mx2 = _find_child_local(_ext2, "Max")
-                _ox2 = _xmplant_generic_attribute(comp, "ORIGINAL_DXF_X")
-                _oy2 = _xmplant_generic_attribute(comp, "ORIGINAL_DXF_Y")
-                if _mn2 is not None and _mx2 is not None and _ox2 and _oy2:
-                    arrowhead_rotations[cid] = _infer_arrow_canvas_rotation(
-                        float(_ox2),
-                        float(_oy2),
-                        _float_attr(_mn2, "X"),
-                        _float_attr(_mx2, "X"),
-                        _float_attr(_mn2, "Y"),
-                        _float_attr(_mx2, "Y"),
-                    )
-                else:
-                    arrowhead_rotations[cid] = -_xmplant_rotation(comp)
-            else:
-                arrowhead_rotations[cid] = -_xmplant_rotation(comp)
-
-    port_map = _build_xmplant_port_map(components, view_box, pixel_scale)
-    for segment in _iter_local(root, "PipingNetworkSegment"):
-        _draw_xmplant_segment(axis, segment, bbox_map, arrowhead_rotations, port_map)
-
-    for component in components.values():
-        _draw_xmplant_component(axis, component, view_box, pixel_scale, use_block_names)
-
-    _finalize_figure(figure, axis, output_stem)
-
-
-def _finalize_figure(figure, axis, output_stem: Path) -> None:
-    axis.set_aspect("equal")
-    axis.axis("off")
-    with mpl.rc_context({"svg.fonttype": "none"}):
-        figure.savefig(
-            _output_file(output_stem, ".png"),
-            dpi=DEFAULT_DPI,
-            bbox_inches="tight",
-            pad_inches=0.02,
-        )
-        figure.savefig(
-            _output_file(output_stem, ".svg"),
-            dpi=DEFAULT_DPI,
-            bbox_inches="tight",
-            pad_inches=0.02,
-        )
-    plt.close(figure)
-
-
-def _build_figure(view_box: ViewBox, pixel_scale: float):
-    width_px = view_box.width * pixel_scale
-    height_px = view_box.height * pixel_scale
-    figure = plt.figure(
-        figsize=(max(8.0, width_px / DEFAULT_DPI), max(6.0, height_px / DEFAULT_DPI)),
-        dpi=DEFAULT_DPI,
-    )
-    axis = figure.add_subplot(111)
-    axis.set_xlim(0, width_px)
-    axis.set_ylim(height_px, 0)
-    return figure, axis
-
-
-def _extract_view_box(root) -> ViewBox:
-    extent = root.find(".//Drawing/Extent")
-    if extent is not None:
-        min_node = extent.find("Min")
-        max_node = extent.find("Max")
-        if min_node is not None and max_node is not None:
-            return ViewBox(
-                _float_attr(min_node, "X"),
-                _float_attr(min_node, "Y"),
-                _float_attr(max_node, "X"),
-                _float_attr(max_node, "Y"),
-            )
-
-    coords = []
-    for coordinate in root.findall(".//Coordinate"):
-        coords.append((_float_attr(coordinate, "X"), _float_attr(coordinate, "Y")))
-    for position in root.findall(".//Position/Location"):
-        coords.append((_float_attr(position, "X"), _float_attr(position, "Y")))
-    if not coords:
-        return ViewBox(0.0, 0.0, 1.0, 1.0)
-    xs = [point[0] for point in coords]
-    ys = [point[1] for point in coords]
-    return ViewBox(min(xs), min(ys), max(xs), max(ys))
-
-
-def _extract_proteus_view_box(root) -> ViewBox:
-    bounds = []
-    for bbox in _iter_local(root, "GraphicBounds"):
-        bounds.append(
-            (
-                _float_attr(bbox, "min_x"),
-                _float_attr(bbox, "min_y"),
-                _float_attr(bbox, "max_x"),
-                _float_attr(bbox, "max_y"),
-            )
-        )
-    for pos in _iter_local(root, "Position"):
-        x = _float_attr(pos, "x")
-        y = _float_attr(pos, "y")
-        if x or y:
-            bounds.append((x, y, x, y))
-    if not bounds:
-        return ViewBox(0.0, 0.0, 1.0, 1.0)
-    min_x = min(item[0] for item in bounds)
-    min_y = min(item[1] for item in bounds)
-    max_x = max(item[2] for item in bounds)
-    max_y = max(item[3] for item in bounds)
-    pw = max((max_x - min_x) * 0.12, 1e-3)
-    ph = max((max_y - min_y) * 0.12, 1e-3)
-    return ViewBox(min_x - pw, min_y - ph, max_x + pw, max_y + ph)
-
-
-def _extract_xmplant_view_box(root) -> ViewBox:
-    bounds = []
-    for comp in _iter_local(root, "PipingComponent"):
-        extent = _find_child_local(comp, "Extent")
-        if extent is not None:
-            min_node = _find_child_local(extent, "Min")
-            max_node = _find_child_local(extent, "Max")
-            if min_node is not None and max_node is not None:
-                bounds.append(
-                    (
-                        _float_attr(min_node, "X"),
-                        _float_attr(min_node, "Y"),
-                        _float_attr(max_node, "X"),
-                        _float_attr(max_node, "Y"),
-                    )
-                )
-        # Location is in scaled DXF units (e.g. 227.76) while Extent is in normalized
-        # space — mixing them would produce a huge view box and wrong pixel_scale.
-    if bounds:
-        min_x = min(item[0] for item in bounds)
-        min_y = min(item[1] for item in bounds)
-        max_x = max(item[2] for item in bounds)
-        max_y = max(item[3] for item in bounds)
-        pw = max((max_x - min_x) * 0.12, 1e-5)
-        ph = max((max_y - min_y) * 0.12, 1e-5)
-        return ViewBox(min_x - pw, min_y - ph, max_x + pw, max_y + ph)
-    return _extract_view_box(root)
-
-
-def _pixel_scale(view_box: ViewBox) -> float:
-    if view_box.width <= 10.0 and view_box.height <= 10.0:
-        return SMALL_MODEL_SCALE
-    return 1.0
-
-
-def _build_component_map(shape_catalogue):
-    component_map = {}
-    if shape_catalogue is None:
-        return component_map
-    for element in list(shape_catalogue):
-        component_name = element.get("ComponentName")
-        if component_name:
-            component_map[component_name] = element
-    return component_map
-
-
-def _iter_render_elements(root):
-    stack = [root]
-    while stack:
-        element = stack.pop()
-        if element.tag == "ShapeCatalogue":
-            continue
-        if element.tag not in PRIMITIVE_TAGS:
-            yield element
-        children = list(element)
-        for child in reversed(children):
-            if child.tag != "ShapeCatalogue":
-                stack.append(child)
-
-
-def _compute_definition_natural_size(
-    definition, transform: Transform, pixel_scale: float
-) -> tuple[float, float]:
-    xs, ys = [], []
-    for child in list(definition):
-        if child.tag in {"PolyLine", "CenterLine", "Shape"}:
-            for coord in child.findall("Coordinate"):
-                xs.append(_float_attr(coord, "X") * transform.sx * pixel_scale)
-                ys.append(_float_attr(coord, "Y") * transform.sy * pixel_scale)
-    if not xs:
-        return (0.0, 0.0)
-    return (max(xs) - min(xs), max(ys) - min(ys))
-
-
-def _draw_catalogue_definition(
-    axis,
-    definition,
-    transform: Transform,
-    view_box: ViewBox,
-    pixel_scale: float,
-) -> None:
-    w, h = _compute_definition_natural_size(definition, transform, pixel_scale)
-    max_dim = max(w, h)
-    if 0.0 < max_dim < MIN_SYMBOL_PX:
-        scale_factor = MIN_SYMBOL_PX / max_dim
-        transform = Transform(
-            tx=transform.tx,
-            ty=transform.ty,
-            rotation_deg=transform.rotation_deg,
-            sx=transform.sx * scale_factor,
-            sy=transform.sy * scale_factor,
-        )
-    for child in list(definition):
-        if child.tag in PRIMITIVE_TAGS:
-            _draw_primitive(axis, child, view_box, pixel_scale, transform=transform)
-
-
-def _draw_primitive(
-    axis,
-    primitive,
-    view_box: ViewBox,
-    pixel_scale: float,
-    transform: Transform | None,
-) -> None:
-    if primitive.tag in {"PolyLine", "CenterLine", "Shape"}:
-        points = _coordinates_from_primitive(primitive, transform)
-        if len(points) < 2:
-            return
-        style = _style_from_presentation(primitive.find("Presentation"), pixel_scale)
-        xs = [point[0] for point in points]
-        ys = [point[1] for point in points]
-        if primitive.tag == "Shape" and primitive.get("Filled") == "Solid":
-            axis.add_patch(
-                Polygon(
-                    [
-                        _to_canvas(point[0], point[1], view_box, pixel_scale)
-                        for point in points
-                    ],
-                    closed=True,
-                    fill=True,
-                    facecolor=style["color"],
-                    edgecolor=style["color"],
-                    linewidth=style["linewidth"],
-                    joinstyle="round",
-                    zorder=3,
-                )
-            )
-            return
-        axis.plot(
-            [_to_canvas_x(x, view_box, pixel_scale) for x in xs],
-            [_to_canvas_y(y, view_box, pixel_scale) for y in ys],
-            color=style["color"],
-            linewidth=style["linewidth"],
-            linestyle=style["linestyle"],
-            solid_capstyle="round",
-            zorder=2,
-        )
-        return
-
-    if primitive.tag == "Circle":
-        style = _style_from_presentation(primitive.find("Presentation"), pixel_scale)
-        center = _circle_center(primitive, transform)
-        scale = math.sqrt(transform.sx * transform.sy) if transform is not None else 1.0
-        radius = _float_attr(primitive, "Radius") * pixel_scale * scale
-        axis.add_patch(
-            Circle(
-                _to_canvas(center[0], center[1], view_box, pixel_scale),
-                radius=radius,
-                fill=primitive.get("Filled") == "Solid",
-                facecolor=(
-                    style["color"] if primitive.get("Filled") == "Solid" else "none"
-                ),
-                edgecolor=style["color"],
-                linewidth=style["linewidth"],
-                zorder=3,
-            )
-        )
-        return
-
-    if primitive.tag == "Ellipse":
-        return
-
-    if primitive.tag == "Text":
-        position = primitive.find("Position/Location")
-        if position is None:
-            return
-        x = _float_attr(position, "X")
-        y = _float_attr(position, "Y")
-        text_style = _style_from_presentation(
-            primitive.find("Presentation"),
-            pixel_scale,
-        )
-        justification = primitive.get("Justification", "CenterCenter")
-        ha, va = _text_alignment(justification)
-        rotation = float(primitive.get("TextAngle", "0") or "0")
-        axis.text(
-            _to_canvas_x(x, view_box, pixel_scale),
-            _to_canvas_y(y, view_box, pixel_scale),
-            primitive.get("String", ""),
-            fontsize=max(6.0, _float_attr(primitive, "Height", 0.002) * pixel_scale),
-            color=text_style["color"],
-            ha=ha,
-            va=va,
-            rotation=-rotation,
-            family=_font_family(primitive.get("Font", "")),
-            zorder=4,
-        )
-
-
-def _draw_proteus_segment(
-    axis,
-    segment,
-    view_box: ViewBox,
-    pixel_scale: float,
-    bbox_map,
-    port_map=None,
-    arrowhead_rotations=None,
-) -> None:
-    start_xml = _find_child_local(segment, "Start")
-    end_xml = _find_child_local(segment, "End")
-    if start_xml is None or end_xml is None:
-        return
-
-    start_id = segment.get("startNode", "")
-    end_id = segment.get("endNode", "")
-    start_box = bbox_map.get(start_id)
-    end_box = bbox_map.get(end_id)
-
-    seg_sx = _to_canvas_x(_float_attr(start_xml, "x"), view_box, pixel_scale)
-    seg_sy = _to_canvas_y(_float_attr(start_xml, "y"), view_box, pixel_scale)
-    seg_ex = _to_canvas_x(_float_attr(end_xml, "x"), view_box, pixel_scale)
-    seg_ey = _to_canvas_y(_float_attr(end_xml, "y"), view_box, pixel_scale)
-
-    style = _proteus_segment_style(segment.get("layer", ""))
-
-    _ar = arrowhead_rotations or {}
-    start_rot = _ar.get(start_id)
-    end_rot = _ar.get(end_id)
-
-    # Use the opposite endpoint as the "facing" reference so we pick the correct port.
-    # Skip stub (T-junction) when the pipe endpoint lands outside the component bbox.
-    if start_box is not None and _is_t_junction(seg_sx, seg_sy, start_box):
-        start_point = (seg_sx, seg_sy)
-    else:
-        start_point = _resolve_port_anchor(
-            axis,
-            start_id,
-            start_box,
-            seg_ex,
-            seg_ey,
-            port_map,
-            style,
-            arrowhead_rotation=start_rot,
-        )
-
-    if end_box is not None and _is_t_junction(seg_ex, seg_ey, end_box):
-        end_point = (seg_ex, seg_ey)
-    else:
-        end_point = _resolve_port_anchor(
-            axis,
-            end_id,
-            end_box,
-            seg_sx,
-            seg_sy,
-            port_map,
-            style,
-            arrowhead_rotation=end_rot,
-        )
-
-    points = _orthogonal_route(
-        start_point,
-        end_point,
-        vertical_first=_arrowhead_arrival_vertical_first(end_rot),
-    )
-    axis.plot(
-        [point[0] for point in points],
-        [point[1] for point in points],
-        color=style["color"],
-        linewidth=style["linewidth"],
-        linestyle=style["linestyle"],
-        solid_capstyle="round",
-        zorder=1,
-    )
-
-    nominal_diameter = segment.get("nominalDiameter", "")
-    if nominal_diameter:
-        mid_x, mid_y = _label_point_for_path(points)
-        axis.text(
-            mid_x,
-            mid_y + TEXT_DISTANCE_FROM_PIPE,
-            nominal_diameter,
-            fontsize=7,
-            color=style["color"],
-            ha="center",
-            va="top",
-            zorder=3,
-        )
-
-
-def _resolve_port_anchor(
-    axis,
-    component_id: str,
-    bbox,
-    target_x: float,
-    target_y: float,
-    port_map,
-    style: dict,
-    arrowhead_rotation: float | None = None,
-) -> tuple[float, float]:
-    """Return the connection anchor for a component, drawing a stub when a port is found."""
-    if port_map is not None:
-        ports = port_map.get(component_id, [])
-        if ports and bbox is not None:
-            port = _find_closest_port(ports, target_x, target_y)
-            stub_tip = _stub_endpoint(port[0], port[1], bbox)
-            axis.plot(
-                [port[0], stub_tip[0]],
-                [port[1], stub_tip[1]],
-                color=style["color"],
-                linewidth=style["linewidth"],
-                linestyle="-",
-                solid_capstyle="round",
-                zorder=2,
-            )
-            return stub_tip
-
-    if bbox is not None:
-        if arrowhead_rotation is not None:
-            return _resolve_arrowhead_anchor(
-                axis, bbox, arrowhead_rotation, target_x, target_y, style
-            )
-        return _bbox_stub_anchor(axis, bbox, target_x, target_y, style)
-
-    return (target_x, target_y)
-
-
-def _draw_proteus_component(
-    axis,
-    component,
-    view_box: ViewBox,
-    pixel_scale: float,
-    use_block_names: bool = False,
-) -> None:
-    position = _find_child_local(component, "Position")
-    bbox_element = _find_child_local(component, "GraphicBounds")
-    if position is None and bbox_element is None:
-        return
-
-    bbox = _bbox_from_proteus_element(component, view_box, pixel_scale)
-    center_x = (bbox.left + bbox.right) / 2.0
-    center_y = (bbox.top + bbox.bottom) / 2.0
-    rotation = -_float_attr(position, "rotation") if position is not None else 0.0
-
-    _src = _normalize_key(_proteus_generic_attribute(component, "SOURCE_SYMBOL"))
-
-    # Flow arrows: infer direction from TIP position vs bbox rather than trusting
-    # the stored rotation (which varies by source block local orientation).
-    if _src == "arrow_head" and position is not None and bbox_element is not None:
-        rotation = _infer_arrow_canvas_rotation(
-            _float_attr(position, "x"),
-            _float_attr(position, "y"),
-            _float_attr(bbox_element, "min_x"),
-            _float_attr(bbox_element, "max_x"),
-            _float_attr(bbox_element, "min_y"),
-            _float_attr(bbox_element, "max_y"),
-        )
-
-    # Connector-type symbols: INSERT at far edge means geometry was mirrored.
-    if "connector" in _src and position is not None and bbox_element is not None:
-        pos_x = _float_attr(position, "x")
-        raw_min_x = _float_attr(bbox_element, "min_x")
-        raw_max_x = _float_attr(bbox_element, "max_x")
-        w = raw_max_x - raw_min_x
-        if w > 1e-9 and (pos_x - raw_min_x) / w > 0.75:
-            rotation += 180.0
-
-        pos_y = _float_attr(position, "y")
-        raw_min_y = _float_attr(bbox_element, "min_y")
-        raw_max_y = _float_attr(bbox_element, "max_y")
-        h = raw_max_y - raw_min_y
-        if h > 1e-9 and (pos_y - raw_min_y) / h > 0.75:
-            rotation += 180.0
-
-    spec = _resolve_proteus_visual_spec(component, bbox)
-    if spec is not None:
-        drawn_bbox = draw_visual_spec(
-            axis, center_x, center_y, spec, rotation, flip_y=True
-        )
-    else:
-        drawn_bbox = _draw_rotated_bbox_fallback(axis, bbox, rotation)
-
-    labels = (
-        _proteus_block_name_labels(component)
-        if use_block_names
-        else _proteus_labels(component)
-    )
-    if labels:
-        _draw_component_label(axis, drawn_bbox, labels)
-
-
-def _draw_xmplant_component(
-    axis,
-    component,
-    view_box: ViewBox,
-    pixel_scale: float,
-    use_block_names: bool = False,
-) -> None:
-    bbox = _bbox_from_xmplant_component(component, view_box, pixel_scale)
-    center_x = (bbox.left + bbox.right) / 2.0
-    center_y = (bbox.top + bbox.bottom) / 2.0
-    rotation = -_xmplant_rotation(component)
-
-    _src = _normalize_key(_xmplant_generic_attribute(component, "SOURCE_SYMBOL"))
-
-    # Flow arrows: infer direction from TIP position (ORIGINAL_DXF_X/Y) vs Extent.
-    # The xmplant converter stores Reference=(1,0) for all arrows regardless of direction.
-    if _src == "arrow_head":
-        _ext = _find_child_local(component, "Extent")
-        if _ext is not None:
-            _mn = _find_child_local(_ext, "Min")
-            _mx = _find_child_local(_ext, "Max")
-            _ox = _xmplant_generic_attribute(component, "ORIGINAL_DXF_X")
-            _oy = _xmplant_generic_attribute(component, "ORIGINAL_DXF_Y")
-            if _mn is not None and _mx is not None and _ox and _oy:
-                rotation = _infer_arrow_canvas_rotation(
-                    float(_ox),
-                    float(_oy),
-                    _float_attr(_mn, "X"),
-                    _float_attr(_mx, "X"),
-                    _float_attr(_mn, "Y"),
-                    _float_attr(_mx, "Y"),
-                )
-
-    # Connector-type symbols: INSERT at far edge means geometry was mirrored.
-    extent = _find_child_local(component, "Extent") if "connector" in _src else None
-    if extent is not None:
-        min_node = _find_child_local(extent, "Min")
-        max_node = _find_child_local(extent, "Max")
-        if min_node is not None and max_node is not None:
-            orig_x_str = _xmplant_generic_attribute(component, "ORIGINAL_DXF_X")
-            if orig_x_str:
-                orig_x = float(str(orig_x_str).replace(",", "."))
-                xmin = _float_attr(min_node, "X")
-                xmax = _float_attr(max_node, "X")
-                w = xmax - xmin
-                if w > 1e-9 and (orig_x - xmin) / w > 0.75:
-                    rotation += 180.0
-
-            orig_y_str = _xmplant_generic_attribute(component, "ORIGINAL_DXF_Y")
-            if orig_y_str:
-                orig_y = float(str(orig_y_str).replace(",", "."))
-                ymin = _float_attr(min_node, "Y")
-                ymax = _float_attr(max_node, "Y")
-                h = ymax - ymin
-                if h > 1e-9 and (orig_y - ymin) / h > 0.75:
-                    rotation += 180.0
-
-    spec = _resolve_xmplant_visual_spec(component, bbox)
-    if spec is not None:
-        drawn_bbox = draw_visual_spec(
-            axis, center_x, center_y, spec, rotation, flip_y=True
-        )
-    else:
-        drawn_bbox = _draw_rotated_bbox_fallback(axis, bbox, rotation)
-
-    labels = (
-        _xmplant_block_name_labels(component)
-        if use_block_names
-        else _xmplant_labels(component)
-    )
-    if labels:
-        _draw_component_label(axis, drawn_bbox, labels)
-
-
-def _bbox_from_proteus_element(
-    component, view_box: ViewBox, pixel_scale: float
-) -> BBox:
-    bbox = _find_child_local(component, "GraphicBounds")
-    if bbox is not None:
-        left = _to_canvas_x(_float_attr(bbox, "min_x"), view_box, pixel_scale)
-        right = _to_canvas_x(_float_attr(bbox, "max_x"), view_box, pixel_scale)
-        top = _to_canvas_y(_float_attr(bbox, "max_y"), view_box, pixel_scale)
-        bottom = _to_canvas_y(_float_attr(bbox, "min_y"), view_box, pixel_scale)
-        return BBox(
-            min(left, right), max(left, right), min(top, bottom), max(top, bottom)
-        )
-
-    position = _find_child_local(component, "Position")
-    x = _to_canvas_x(_float_attr(position, "x"), view_box, pixel_scale)
-    y = _to_canvas_y(_float_attr(position, "y"), view_box, pixel_scale)
-    return BBox(x - 6.0, x + 6.0, y - 6.0, y + 6.0)
-
-
-def _bbox_from_xmplant_component(
-    component, view_box: ViewBox, pixel_scale: float
-) -> BBox:
-    extent = _find_child_local(component, "Extent")
-    if extent is None:
-        position = _find_child_local(component, "Position")
-        location = (
-            _find_child_local(position, "Location") if position is not None else None
-        )
-        if location is None:
-            return BBox(0.0, 12.0, 0.0, 12.0)
-        x = _to_canvas_x(_float_attr(location, "X"), view_box, pixel_scale)
-        y = _to_canvas_y(_float_attr(location, "Y"), view_box, pixel_scale)
-        return BBox(x - 6.0, x + 6.0, y - 6.0, y + 6.0)
-
-    min_node = _find_child_local(extent, "Min")
-    max_node = _find_child_local(extent, "Max")
-    if min_node is None or max_node is None:
-        return BBox(0.0, 12.0, 0.0, 12.0)
-
-    left = _to_canvas_x(_float_attr(min_node, "X"), view_box, pixel_scale)
-    right = _to_canvas_x(_float_attr(max_node, "X"), view_box, pixel_scale)
-    top = _to_canvas_y(_float_attr(max_node, "Y"), view_box, pixel_scale)
-    bottom = _to_canvas_y(_float_attr(min_node, "Y"), view_box, pixel_scale)
-    return BBox(min(left, right), max(left, right), min(top, bottom), max(top, bottom))
-
-
-def _resolve_proteus_visual_spec(component, bbox: BBox) -> VisualSpec | None:
-    symbol_key = _proteus_generic_attribute(component, "SOURCE_SYMBOL")
-    raw_symbol_key = _proteus_generic_attribute(component, "SOURCE_SYMBOL_RAW")
-    candidates = [
-        symbol_key,
-        raw_symbol_key,
-        component.get("blockName", ""),
-        component.get("componentName", ""),
-        component.get("componentSubType", ""),
-        component.get("componentClass", ""),
-    ]
-
-    file_name = ""
-    for candidate in candidates:
-        file_name = _resolve_asset_file(candidate)
-        if file_name:
-            break
-
-    if not file_name:
-        return None
-
-    return VisualSpec(
-        "dxf",
-        max(bbox.width, MIN_SYMBOL_PX),
-        max(bbox.height, MIN_SYMBOL_PX),
-        file_name,
-    )
-
-
-def _resolve_xmplant_visual_spec(component, bbox: BBox) -> VisualSpec | None:
-    candidates = [
-        _xmplant_generic_attribute(component, "SOURCE_SYMBOL"),
-        _xmplant_generic_attribute(component, "SOURCE_SYMBOL_RAW"),
-        _xmplant_generic_attribute(component, "DXF_BLOCK_NAME"),
-        component.get("ComponentName", ""),
-        component.get("TagName", ""),
-        component.get("ComponentClass", ""),
-        _xmplant_generic_attribute(component, "SUB_CLASS"),
-    ]
-
-    file_name = ""
-    for candidate in candidates:
-        file_name = _resolve_asset_file(candidate)
-        if file_name:
-            break
-
-    if not file_name:
-        return None
-
-    return VisualSpec(
-        "dxf",
-        max(bbox.width, MIN_SYMBOL_PX),
-        max(bbox.height, MIN_SYMBOL_PX),
-        file_name,
-    )
-
-
-def _resolve_asset_file(symbol_key: str) -> str:
-    normalized = _normalize_key(symbol_key)
-    if not normalized:
-        return ""
-
-    candidates = [normalized]
-    aliased = PROTEUS_SYMBOL_ALIASES.get(normalized, "")
-    if aliased:
-        candidates.insert(0, aliased)
-
-    exact_map = _asset_name_map()
-    for candidate in candidates:
-        if candidate in exact_map:
-            return exact_map[candidate]
-
-    best_name = ""
-    best_score = 0
-    for candidate in candidates:
-        candidate_tokens = {token for token in candidate.split("_") if len(token) >= 2}
-        if not candidate_tokens:
-            continue
-        for asset_key, asset_name in exact_map.items():
-            asset_tokens = {token for token in asset_key.split("_") if len(token) >= 2}
-            overlap = len(candidate_tokens & asset_tokens)
-            if overlap > best_score:
-                best_score = overlap
-                best_name = asset_name
-            elif overlap == best_score and overlap > 0 and best_name:
-                if len(asset_name) < len(best_name):
-                    best_name = asset_name
-
-    if best_score > 0:
-        return best_name
-    return ""
-
-
-def _draw_rotated_bbox_fallback(axis, bbox: BBox, rotation: float) -> BBox:
-    center_x = (bbox.left + bbox.right) / 2.0
-    center_y = (bbox.top + bbox.bottom) / 2.0
-    half_w = bbox.width / 2.0
-    half_h = bbox.height / 2.0
-    corners = [
-        (center_x - half_w, center_y - half_h),
-        (center_x + half_w, center_y - half_h),
-        (center_x + half_w, center_y + half_h),
-        (center_x - half_w, center_y + half_h),
-    ]
-    rotated = [
-        _rotate_point(point, (center_x, center_y), rotation) for point in corners
-    ]
-    axis.add_patch(
-        Polygon(
-            rotated,
-            closed=True,
-            fill=False,
-            edgecolor="#222222",
-            linewidth=1.2,
-            zorder=3,
-        )
-    )
-    xs = [point[0] for point in rotated]
-    ys = [point[1] for point in rotated]
-    return BBox(min(xs), max(xs), min(ys), max(ys))
-
-
-def _draw_component_label(axis, bbox: BBox, labels: list[str]) -> None:
-    text = "\n".join(labels[:3])
-    axis.text(
-        bbox.right + 4.0,
-        (bbox.top + bbox.bottom) / 2.0,
-        text,
-        fontsize=8,
-        color="#111111",
-        ha="left",
-        va="center",
-        zorder=5,
-    )
-
-
-def _proteus_segment_style(layer_name: str):
-    normalized = (layer_name or "").strip().lower()
-    if "signal" in normalized:
-        return {"color": "#444444", "linewidth": 1.0, "linestyle": "--"}
-    if "instrument" in normalized:
-        return {"color": "#777777", "linewidth": 1.0, "linestyle": "--"}
-    if "off_page" in normalized:
-        return {"color": "#222222", "linewidth": 1.4, "linestyle": "-"}
-    return {"color": "#222222", "linewidth": 1.8, "linestyle": "-"}
-
-
-def _proteus_labels(component) -> list[str]:
-    labels = []
-    tag_name = (component.get("tagName") or "").strip()
-    if tag_name:
-        labels.append(tag_name)
-
-    nearby = _find_child_local(component, "NearbyLabels")
-    if nearby is not None:
-        for label in _find_children_local(nearby, "Label"):
-            text = (label.text or "").strip()
-            if text and text not in labels:
-                labels.append(text)
-    return labels
-
-
-def _xmplant_labels(component) -> list[str]:
-    labels = []
-    tag_name = (component.get("TagName") or "").strip()
-    if tag_name:
-        labels.append(tag_name)
-    short_tag = _xmplant_generic_attribute(component, "TAG").strip()
-    if short_tag and short_tag not in labels:
-        labels.append(short_tag)
-    return labels
-
-
-def _proteus_block_name_labels(component) -> list[str]:
-    block = (component.get("blockName") or "").strip()
-    return [block] if block else []
-
-
-def _xmplant_block_name_labels(component) -> list[str]:
-    block = _xmplant_generic_attribute(component, "DXF_BLOCK_NAME").strip()
-    return [block] if block else []
-
-
-def _proteus_generic_attribute(component, name: str) -> str:
-    generic_attributes = _find_child_local(component, "GenericAttributes")
-    if generic_attributes is None:
-        return ""
-    for attribute in _find_children_local(generic_attributes, "GenericAttribute"):
-        if attribute.get("Name") == name:
-            return attribute.get("Value", "")
-    return ""
-
-
-def _xmplant_generic_attribute(component, name: str) -> str:
-    generic_attributes = _find_child_local(component, "GenericAttributes")
-    if generic_attributes is None:
-        return ""
-    for attribute in _find_children_local(generic_attributes, "GenericAttribute"):
-        if attribute.get("Name") == name:
-            return attribute.get("Value", "")
-    return ""
-
-
-def _xmplant_rotation(component) -> float:
-    position = _find_child_local(component, "Position")
-    if position is None:
-        return 0.0
-    reference = _find_child_local(position, "Reference")
-    if reference is not None:
-        ref_x = _float_attr(reference, "X", 1.0)
-        ref_y = _float_attr(reference, "Y", 0.0)
-        return math.degrees(math.atan2(ref_y, ref_x))
-    return 0.0
-
-
-def _draw_xmplant_segment(
-    axis, segment, bbox_map, arrowhead_rotations=None, port_map=None
-) -> None:
-    connection = _find_child_local(segment, "Connection")
-    if connection is None:
-        return
-
-    from_id = connection.get("FromID", "")
-    to_id = connection.get("ToID", "")
-    from_box = bbox_map.get(from_id)
-    to_box = bbox_map.get(to_id)
-    if from_box is None or to_box is None:
-        return
-
-    _ar = arrowhead_rotations or {}
-    from_rot = _ar.get(from_id)
-    to_rot = _ar.get(to_id)
-
-    style = _xmplant_segment_style(segment)
-
-    to_cx = (to_box.left + to_box.right) / 2.0
-    to_cy = (to_box.top + to_box.bottom) / 2.0
-    fr_cx = (from_box.left + from_box.right) / 2.0
-    fr_cy = (from_box.top + from_box.bottom) / 2.0
-
-    start = (
-        _resolve_arrowhead_anchor(axis, from_box, from_rot, to_cx, to_cy, style)
-        if from_rot is not None
-        else _resolve_port_anchor(
-            axis, from_id, from_box, to_cx, to_cy, port_map, style
-        )
-    )
-    end = (
-        _resolve_arrowhead_anchor(axis, to_box, to_rot, fr_cx, fr_cy, style)
-        if to_rot is not None
-        else _resolve_port_anchor(axis, to_id, to_box, fr_cx, fr_cy, port_map, style)
-    )
-    points = _orthogonal_route(
-        start, end, vertical_first=_arrowhead_arrival_vertical_first(to_rot)
-    )
-    axis.plot(
-        [point[0] for point in points],
-        [point[1] for point in points],
-        color=style["color"],
-        linewidth=style["linewidth"],
-        linestyle=style["linestyle"],
-        solid_capstyle="round",
-        zorder=1,
-    )
-
-    nominal_diameter = _xmplant_segment_attr(segment, "NOMINAL_DIAMETER")
-    if nominal_diameter:
-        mid_x, mid_y = _label_point_for_path(points)
-        axis.text(
-            mid_x,
-            mid_y + 6,
-            nominal_diameter,
-            fontsize=7,
-            color=style["color"],
-            ha="center",
-            va="top",
-            zorder=3,
-        )
-
-
-def _build_port_map(components: dict, view_box: ViewBox, pixel_scale: float) -> dict:
-    port_map = {}
-    for component_id, component in components.items():
-        conn_pts = _find_child_local(component, "ConnectionPoints")
-        if conn_pts is None:
-            port_map[component_id] = []
-            continue
-        ports = []
-        for node in _find_children_local(conn_pts, "Node"):
-            position = _find_child_local(node, "Position")
-            if position is None:
-                continue
-            location = _find_child_local(position, "Location")
-            if location is None:
-                continue
-            px = _to_canvas_x(_float_attr(location, "X"), view_box, pixel_scale)
-            py = _to_canvas_y(_float_attr(location, "Y"), view_box, pixel_scale)
-            ports.append((px, py))
-        port_map[component_id] = ports
-    return port_map
-
-
-def _build_xmplant_port_map(
-    components: dict, view_box: ViewBox, pixel_scale: float
-) -> dict:
-    """Read PORT_N_X / PORT_N_Y GenericAttributes from xmplant PipingComponents."""
-    port_map = {}
-    for component_id, component in components.items():
-        count_str = _xmplant_generic_attribute(component, "PORT_COUNT")
-        if not count_str:
-            port_map[component_id] = []
-            continue
-        try:
-            count = int(count_str)
-        except ValueError:
-            port_map[component_id] = []
-            continue
-        ports = []
-        for n in range(1, count + 1):
-            x_str = _xmplant_generic_attribute(component, f"PORT_{n}_X")
-            y_str = _xmplant_generic_attribute(component, f"PORT_{n}_Y")
-            if x_str and y_str:
-                try:
-                    px = _to_canvas_x(float(x_str), view_box, pixel_scale)
-                    py = _to_canvas_y(float(y_str), view_box, pixel_scale)
-                    ports.append((px, py))
-                except ValueError:
-                    pass
-        port_map[component_id] = ports
-    return port_map
-
-
-def _find_closest_port(
-    ports: list, target_x: float, target_y: float
-) -> tuple[float, float]:
-    return min(ports, key=lambda p: (p[0] - target_x) ** 2 + (p[1] - target_y) ** 2)
-
-
-def _stub_endpoint(port_x: float, port_y: float, bbox: BBox) -> tuple[float, float]:
-    cx = (bbox.left + bbox.right) / 2.0
-    cy = (bbox.top + bbox.bottom) / 2.0
-    dx = port_x - cx
-    dy = port_y - cy
-    dist = math.sqrt(dx * dx + dy * dy)
-    max_dim = max(bbox.width, bbox.height)
-    length = max(STUB_LENGTH_PX, max_dim * 0.5)
-    if dist < 1e-9:
-        return port_x + length, port_y
-    return port_x + dx / dist * length, port_y + dy / dist * length
-
-
-def _component_is_arrowhead(candidates: list[str]) -> bool:
-    """Return True if any candidate string suggests a pipe-flow arrowhead symbol."""
-    for c in candidates:
-        n = _normalize_key(c)
-        if "arrow" in n or "pipe_flow" in n or "flow_arrow" in n:
-            return True
-    return False
-
-
-def _arrowhead_anchor(
-    bbox: "BBox", rotation_deg: float, target_x: float, target_y: float
-) -> tuple[float, float]:
-    """Return whichever of tip or base is closer to (target_x, target_y)."""
-    cx = (bbox.left + bbox.right) / 2.0
-    cy = (bbox.top + bbox.bottom) / 2.0
-    cos_a = math.cos(math.radians(rotation_deg))
-    sin_a = math.sin(math.radians(rotation_deg))
-    half = (abs(cos_a) * bbox.width + abs(sin_a) * bbox.height) / 2.0
-    tip = (cx + cos_a * half, cy + sin_a * half)
-    base = (cx - cos_a * half, cy - sin_a * half)
-    d_tip = (tip[0] - target_x) ** 2 + (tip[1] - target_y) ** 2
-    d_base = (base[0] - target_x) ** 2 + (base[1] - target_y) ** 2
-    return tip if d_tip < d_base else base
-
-
-def _infer_arrow_canvas_rotation(
-    px: float,
-    py: float,
-    xmin: float,
-    xmax: float,
-    ymin: float,
-    ymax: float,
-) -> float:
-    """Return the canvas rotation (degrees) for a flow arrow by finding which bbox
-    edge the TIP (INSERT position px,py) is closest to.
-
-    The DXF INSERT places the arrow TIP at (px, py). The arrow_head.dxf asset has its
-    TIP at min-X (left) in the loaded geometry (the modelspace INSERT has rotation=180°),
-    so canvas_rotation=0 draws pointing LEFT and canvas_rotation=180 draws pointing RIGHT.
-    """
-    w = xmax - xmin
-    h = ymax - ymin
-    rx = (px - xmin) / w if w > 1e-9 else 0.5
-    ry = (py - ymin) / h if h > 1e-9 else 0.5
-    # Score each edge by how close the TIP is to it (1.0 = exactly on that edge).
-    # Asset at rot=0→LEFT, rot=180→RIGHT, rot=90→UP, rot=-90→DOWN (canvas Y-down).
-    candidates = [
-        (rx, 180.0),  # TIP near right edge  → RIGHT (needs 180°)
-        (1.0 - rx, 0.0),  # TIP near left edge   → LEFT  (needs 0°)
-        (ry, 90.0),  # TIP near world max_y → UP    (needs 90°, canvas Y inverted)
-        (1.0 - ry, -90.0),  # TIP near world min_y → DOWN  (needs -90°)
-    ]
-    return max(candidates, key=lambda c: c[0])[1]
-
-
-def _resolve_arrowhead_anchor(
-    axis,
-    bbox: "BBox",
-    rotation_deg: float,
-    target_x: float,
-    target_y: float,
-    style: dict,
-) -> tuple[float, float]:
-    """Pick tip or base (whichever is closer to target), draw a stub extending outward, return stub end."""
-    cx = (bbox.left + bbox.right) / 2.0
-    cy = (bbox.top + bbox.bottom) / 2.0
-    cos_a = math.cos(math.radians(rotation_deg))
-    sin_a = math.sin(math.radians(rotation_deg))
-    half = (abs(cos_a) * bbox.width + abs(sin_a) * bbox.height) / 2.0
-
-    tip = (cx + cos_a * half, cy + sin_a * half)
-    base = (cx - cos_a * half, cy - sin_a * half)
-    d_tip = (tip[0] - target_x) ** 2 + (tip[1] - target_y) ** 2
-    d_base = (base[0] - target_x) ** 2 + (base[1] - target_y) ** 2
-
-    if d_tip < d_base:
-        face = tip
-        stub_dir = (cos_a, sin_a)
-    else:
-        face = base
-        stub_dir = (-cos_a, -sin_a)
-
-    stub_len = max(STUB_LENGTH_PX, max(bbox.width, bbox.height) * 0.5)
-    stub_end = (face[0] + stub_dir[0] * stub_len, face[1] + stub_dir[1] * stub_len)
-
-    axis.plot(
-        [face[0], stub_end[0]],
-        [face[1], stub_end[1]],
-        color=style["color"],
-        linewidth=style["linewidth"],
-        linestyle="-",
-        solid_capstyle="round",
-        zorder=2,
-    )
-    return stub_end
-
-
-def _arrowhead_arrival_vertical_first(rotation_deg: float | None) -> bool:
-    """True when the arrow is more horizontal — route vertical-first to arrive along the arrow axis."""
-    if rotation_deg is None:
-        return False
-    cos_a = math.cos(math.radians(rotation_deg))
-    sin_a = math.sin(math.radians(rotation_deg))
-    return abs(cos_a) > abs(sin_a)
-
-
-def _bbox_anchor(box: BBox, other: BBox) -> tuple[float, float]:
-    cx = (box.left + box.right) / 2.0
-    cy = (box.top + box.bottom) / 2.0
-    ox = (other.left + other.right) / 2.0
-    oy = (other.top + other.bottom) / 2.0
-    dx = ox - cx
-    dy = oy - cy
-    if abs(dx) >= abs(dy):
-        return (box.right, cy) if dx >= 0 else (box.left, cy)
-    return (cx, box.bottom) if dy >= 0 else (cx, box.top)
-
-
-def _bbox_stub_anchor(
-    axis, box: BBox, target_x: float, target_y: float, style: dict
-) -> tuple[float, float]:
-    """Compute bbox-edge face toward target, draw a stub extending outward, return stub tip."""
-    cx = (box.left + box.right) / 2.0
-    cy = (box.top + box.bottom) / 2.0
-    dx = target_x - cx
-    dy = target_y - cy
-    if abs(dx) >= abs(dy):
-        face = (box.right if dx >= 0 else box.left, cy)
-    else:
-        face = (cx, box.top if dy >= 0 else box.bottom)
-    dist = math.sqrt(dx * dx + dy * dy)
-    if dist < 1e-9:
-        return face
-    stub_len = max(STUB_LENGTH_PX, max(box.width, box.height) * 0.5)
-    tip = (face[0] + dx / dist * stub_len, face[1] + dy / dist * stub_len)
-    axis.plot(
-        [face[0], tip[0]],
-        [face[1], tip[1]],
-        color=style["color"],
-        linewidth=style["linewidth"],
-        linestyle="-",
-        solid_capstyle="round",
-        zorder=2,
-    )
-    return tip
-
-
-def _is_t_junction(px: float, py: float, bbox: BBox, tol: float = 1.0) -> bool:
-    """True if the pipe endpoint lies outside the component bbox (T-junction onto another pipe)."""
-    left = min(bbox.left, bbox.right) - tol
-    right = max(bbox.left, bbox.right) + tol
-    top = min(bbox.top, bbox.bottom) - tol
-    bottom = max(bbox.top, bbox.bottom) + tol
-    return not (left <= px <= right and top <= py <= bottom)
-
-
-def _orthogonal_route(
-    start: tuple[float, float],
-    end: tuple[float, float],
-    vertical_first: bool = False,
-) -> list[tuple[float, float]]:
-    sx, sy = start
-    ex, ey = end
-    if math.isclose(sx, ex, abs_tol=0.1) or math.isclose(sy, ey, abs_tol=0.1):
-        return [start, end]
-
-    # vertical_first: go down/up to match end Y, then horizontal — arrives at end horizontally
-    bend = (sx, ey) if vertical_first else (ex, sy)
-    return [start, bend, end]
-
-
-def _label_point_for_path(points: list[tuple[float, float]]) -> tuple[float, float]:
-    best_len = -1.0
-    best_mid = points[0]
-    for i in range(len(points) - 1):
-        x1, y1 = points[i]
-        x2, y2 = points[i + 1]
-        length = math.hypot(x2 - x1, y2 - y1)
-        if length > best_len:
-            best_len = length
-            best_mid = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
-    return best_mid
-
-
-def _xmplant_segment_style(segment):
-    connection_type = _xmplant_segment_attr(segment, "CONNECTION_TYPE").lower()
-    sub_class = _xmplant_segment_attr(segment, "SUB_CLASS").lower()
-    normalized = f"{connection_type} {sub_class}"
-    if "signal" in normalized:
-        return {"color": "#444444", "linewidth": 1.0, "linestyle": "--"}
-    if "instrument" in normalized:
-        return {"color": "#666666", "linewidth": 1.0, "linestyle": "--"}
-    if "off-page" in normalized or "off_page" in normalized:
-        return {"color": "#222222", "linewidth": 1.4, "linestyle": "-"}
-    return {"color": "#222222", "linewidth": 1.8, "linestyle": "-"}
-
-
-def _xmplant_segment_attr(segment, name: str) -> str:
-    generic_attributes = _find_child_local(segment, "GenericAttributes")
-    if generic_attributes is None:
-        return ""
-    for attribute in _find_children_local(generic_attributes, "GenericAttribute"):
-        if attribute.get("Name") == name:
-            return attribute.get("Value", "")
-    return ""
-
-
-def _coordinates_from_primitive(primitive, transform: Transform | None):
-    points = []
-    for coordinate in primitive.findall("Coordinate"):
-        x = _float_attr(coordinate, "X")
-        y = _float_attr(coordinate, "Y")
-        if transform is not None:
-            x, y = transform.apply(x, y)
-        points.append((x, y))
-    return points
-
-
-def _circle_center(primitive, transform: Transform | None):
-    location = primitive.find("Position/Location")
-    if location is None:
-        x = 0.0
-        y = 0.0
-    else:
-        x = _float_attr(location, "X")
-        y = _float_attr(location, "Y")
-    if transform is not None:
-        x, y = transform.apply(x, y)
-    return (x, y)
-
-
-def _transform_from_element(element) -> Transform:
-    position = element.find("Position")
-    scale = element.find("Scale")
-    tx = 0.0
-    ty = 0.0
-    rotation_deg = 0.0
-    sx = 1.0
-    sy = 1.0
-
-    if position is not None:
-        location = position.find("Location")
-        reference = position.find("Reference")
-        if location is not None:
-            tx = _float_attr(location, "X")
-            ty = _float_attr(location, "Y")
-        if reference is not None:
-            ref_x = _float_attr(reference, "X", 1.0)
-            ref_y = _float_attr(reference, "Y", 0.0)
-            rotation_deg = math.degrees(math.atan2(ref_y, ref_x))
-
-    if scale is not None:
-        sx = _float_attr(scale, "X", 1.0)
-        sy = _float_attr(scale, "Y", 1.0)
-
-    return Transform(tx=tx, ty=ty, rotation_deg=rotation_deg, sx=sx, sy=sy)
-
-
-def _style_from_presentation(presentation, pixel_scale: float):
-    color = _color_from_presentation(presentation)
-    line_weight = 0.0002
-    line_type = "0"
-    if presentation is not None:
-        line_weight = _float_attr(presentation, "LineWeight", 0.0002)
-        line_type = presentation.get("LineType", "0")
-    linewidth = max(0.8, line_weight * pixel_scale)
-    linestyle = "-" if line_type in {"", "0"} else "--"
-    return {"color": color, "linewidth": linewidth, "linestyle": linestyle}
-
-
-def _color_from_presentation(presentation):
-    if presentation is None:
-        return "#000000"
-    r = int(max(0.0, min(1.0, _float_attr(presentation, "R", 0.0))) * 255)
-    g = int(max(0.0, min(1.0, _float_attr(presentation, "G", 0.0))) * 255)
-    b = int(max(0.0, min(1.0, _float_attr(presentation, "B", 0.0))) * 255)
-    return f"#{r:02x}{g:02x}{b:02x}"
-
-
-def _text_alignment(justification: str) -> tuple[str, str]:
-    mapping = {
-        "CenterCenter": ("center", "center"),
-        "RightTop": ("right", "top"),
-        "RightCenter": ("right", "center"),
-        "LeftCenter": ("left", "center"),
-        "LeftTop": ("left", "top"),
-        "CenterTop": ("center", "top"),
-        "CenterBottom": ("center", "bottom"),
-        "RightBottom": ("right", "bottom"),
-        "LeftBottom": ("left", "bottom"),
-    }
-    return mapping.get(justification, ("center", "center"))
-
-
-def _to_canvas(
-    point_x: float,
-    point_y: float,
-    view_box: ViewBox,
-    pixel_scale: float,
-) -> tuple[float, float]:
-    return (
-        _to_canvas_x(point_x, view_box, pixel_scale),
-        _to_canvas_y(point_y, view_box, pixel_scale),
-    )
-
-
-def _to_canvas_x(point_x: float, view_box: ViewBox, pixel_scale: float) -> float:
-    return (point_x - view_box.min_x) * pixel_scale
-
-
-def _to_canvas_y(point_y: float, view_box: ViewBox, pixel_scale: float) -> float:
-    return (view_box.max_y - point_y) * pixel_scale
-
-
 def _float_attr(element, key: str, default: float = 0.0) -> float:
+    if element is None:
+        return default
     value = element.get(key)
     if value in (None, ""):
         return default
     return float(str(value).replace(",", "."))
 
 
-def _font_family(font_name: str) -> str:
-    normalized = (font_name or "").strip().lower()
-    if normalized in {"calibri", ""}:
-        return "DejaVu Sans"
-    return font_name
-
-
 def _local_name(tag: str) -> str:
     return tag.split("}", 1)[-1]
 
 
-def _iter_local(root, name: str):
-    for element in root.iter():
-        if _local_name(element.tag) == name:
-            yield element
-
-
 def _find_child_local(element, name: str):
+    if element is None:
+        return None
     for child in list(element):
         if _local_name(child.tag) == name:
             return child
@@ -1587,57 +501,6 @@ def _find_child_local(element, name: str):
 
 
 def _find_children_local(element, name: str):
+    if element is None:
+        return []
     return [child for child in list(element) if _local_name(child.tag) == name]
-
-
-def _normalize_key(value: str) -> str:
-    value = _camel_to_snake(value or "")
-    cleaned = []
-    for char in value.strip().lower():
-        cleaned.append(char if char.isalnum() else "_")
-    normalized = "".join(cleaned)
-    while "__" in normalized:
-        normalized = normalized.replace("__", "_")
-    return normalized.strip("_")
-
-
-def _camel_to_snake(value: str) -> str:
-    chars = []
-    previous = ""
-    for char in value:
-        if previous and previous.islower() and char.isupper():
-            chars.append("_")
-        chars.append(char)
-        previous = char
-    return "".join(chars)
-
-
-def _rotate_point(
-    point: tuple[float, float],
-    center: tuple[float, float],
-    rotation_deg: float,
-) -> tuple[float, float]:
-    angle = math.radians(rotation_deg)
-    cos_a = math.cos(angle)
-    sin_a = math.sin(angle)
-    px = point[0] - center[0]
-    py = point[1] - center[1]
-    return (
-        center[0] + px * cos_a - py * sin_a,
-        center[1] + px * sin_a + py * cos_a,
-    )
-
-
-def _asset_name_map():
-    return _asset_name_map_cached()
-
-
-@lru_cache(maxsize=1)
-def _asset_name_map_cached():
-    # Skip editor/temp artifacts (e.g. "#NAME.dxf"); they are not real assets and
-    # otherwise collide with the real "NAME.dxf" on the normalized lookup key.
-    return {
-        _normalize_key(path.stem): path.name
-        for path in ASSET_DIR.glob("*.dxf")
-        if not path.name.startswith("#")
-    }

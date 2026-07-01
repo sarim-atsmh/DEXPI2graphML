@@ -193,24 +193,10 @@ def _normalized_plot_path(path_plot):
     return str(path)
 
 
-def plot_graph(Path_graph, Path_plot):
-    from dxf_renderer import render_graph_plot
-
-    render_graph_plot(Path_graph, Path_plot)
-
-
-def plot_graph2(Path_graph, Path_plot):
-    from dxf_renderer import render_graph_plot
-
-    render_graph_plot(Path_graph, Path_plot)
-
-
-def render_plot(Path_dexpi, Path_graph, Path_plot, include_xmplant: bool = False):
+def render_plot(Path_dexpi, Path_plot):
     from dexpi_xml_renderer import render_dexpi_plot
 
-    render_dexpi_plot(
-        Path_dexpi, Path_graph, Path_plot, include_xmplant=include_xmplant
-    )
+    render_dexpi_plot(Path_dexpi, Path_plot)
 
 
 def Dexpi2graph(

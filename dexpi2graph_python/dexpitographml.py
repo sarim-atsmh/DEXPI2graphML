@@ -49,7 +49,6 @@ col_left = [
     [psg.Output(size=(60, 30), key="_output_")],
     [
         psg.Button("Convert", enable_events=True),
-        psg.Checkbox("Include xmplant output", key="xmplant_output", default=False),
         psg.Text(
             "Ready...", key="status_text", text_color="green", background_color="white", enable_events=True
         ),
@@ -131,7 +130,7 @@ while True:
             print("Open Directory:", dexpi_root)
             print("Start Conversion of DEXPI files into GraphML...")
 
-            for xml_path in sorted(dexpi_root.rglob("*.xml")):
+            for xml_path in sorted(dexpi_root.rglob("*.dexpi.xml")):
                 savename = "__".join(
                     xml_path.relative_to(dexpi_root).with_suffix("").parts
                 ).replace(" ", "_")
@@ -146,9 +145,7 @@ while True:
                 )
                 functions.render_plot(
                     str(xml_path),
-                    str(OUTPUT_GRAPHML_COMPLETE_DIR / (savename + ".xml")),
                     str(OUTPUT_PLOTS_DIR / savename),
-                    include_xmplant=values["xmplant_output"],
                 )
         list_elem.update(list_plot_files())
 
