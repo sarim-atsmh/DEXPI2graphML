@@ -97,7 +97,7 @@ def render_dexpi_plot(path_xml: str, path_plot_stem: str) -> None:
     """Render ``path_xml`` to two variants:
 
     ``<stem>.png``/``.svg``          — clean (no block-name labels)
-    ``<stem>_labeled.png``/``.svg``  — each component's ``ComponentName`` overlaid
+    ``<stem>_labeled.png``/``.svg``  — each component's ``ID`` overlaid
     """
     stem = _normalized_output_stem(path_plot_stem)
     root = ET.parse(Path(path_xml)).getroot()
@@ -134,10 +134,12 @@ def _render_plantmodel(
                 view_box,
                 pixel_scale,
             )
-            if show_component_labels and component_name:
-                bbox = _instance_bbox(instance, view_box, pixel_scale)
-                if bbox is not None:
-                    _draw_component_label(axis, bbox, [component_name])
+            if show_component_labels:
+                component_id = instance.get("ID")
+                if component_id:
+                    bbox = _instance_bbox(instance, view_box, pixel_scale)
+                    if bbox is not None:
+                        _draw_component_label(axis, bbox, [component_id])
         else:
             _draw_placeholder(axis, instance, view_box, pixel_scale)
 
@@ -385,7 +387,7 @@ def _draw_component_label(axis, bbox: BBox, labels: list[str]) -> None:
         bbox.right + 4.0,
         (bbox.top + bbox.bottom) / 2.0,
         "\n".join(labels[:3]),
-        fontsize=2.0,
+        fontsize=5.0,
         color="#111111",
         ha="left",
         va="center",
