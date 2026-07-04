@@ -2,21 +2,41 @@ from functools import lru_cache
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import Element
 
+# Default file, used when the module is run standalone. The GUI overrides this
+# by calling load_xml() with a user-selected path.
 XML_PATH = "/home/rapidswords/SMH Coders/Kent/ConvertingDXFtoDEXPI/out/PA-A11090-001-3/PA-A11090-001-3.dexpi.xml"
 
-# with open(XML_PATH, 'r') as xml_file:
-# 	xml_data = xml_file.read()
+# Populated by load_xml(). Left empty until a file is loaded so importing this
+# module never fails on a missing/invalid default path.
+root = None
+ROOT_PIPING_COMPONENTS = []
+PIPING_NETWORK_SYSTEM = None
+PIPING_NETWORK_SEGMENTS = []
+SHAPE_CATALOGUE = None
+SHAPE_PIPING_COMPONENTS = []
 
 
-tree = ET.parse(XML_PATH)
-root = tree.getroot()
+def load_xml(path: str) -> None:
+    """(Re)parse the DEXPI file at ``path`` and reset the lookup caches.
 
-ROOT_PIPING_COMPONENTS = root.findall("PipingComponent")
-PIPING_NETWORK_SYSTEM = root.find("PipingNetworkSystem")
-PIPING_NETWORK_SEGMENTS = PIPING_NETWORK_SYSTEM.findall("PipingNetworkSegment")
-SHAPE_CATALOGUE = root.find("ShapeCatalogue")
+    Rebinds the module-level element lists that the get_* functions read, so a
+    fresh file fully replaces the previous one.
+    """
+    global XML_PATH, root, ROOT_PIPING_COMPONENTS, PIPING_NETWORK_SYSTEM
+    global PIPING_NETWORK_SEGMENTS, SHAPE_CATALOGUE, SHAPE_PIPING_COMPONENTS
 
-SHAPE_PIPING_COMPONENTS = SHAPE_CATALOGUE.findall("PipingComponent")
+    root = ET.parse(path).getroot()
+    ROOT_PIPING_COMPONENTS = root.findall("PipingComponent")
+    PIPING_NETWORK_SYSTEM = root.find("PipingNetworkSystem")
+    PIPING_NETWORK_SEGMENTS = PIPING_NETWORK_SYSTEM.findall("PipingNetworkSegment")
+    SHAPE_CATALOGUE = root.find("ShapeCatalogue")
+    SHAPE_PIPING_COMPONENTS = SHAPE_CATALOGUE.findall("PipingComponent")
+    XML_PATH = path
+
+    # New file -> stale results; drop the memoized lookups.
+    get_from_of.cache_clear()
+    get_to_of.cache_clear()
+    get_name.cache_clear()
 
 
 # for pc in SHAPE_PIPING_COMPONENTS:
@@ -76,6 +96,7 @@ def get_name(comp_id: str) -> str:
             return pc.attrib["ComponentName"]
 
 if __name__ == "__main__":
+    load_xml(XML_PATH)
     COMPONENT = "C-044"
 
     print(
