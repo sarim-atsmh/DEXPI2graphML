@@ -3,3 +3,4 @@ __pycache__/
 Output/
 .folder_path
 *.dxf~
+.connections_xml_path
