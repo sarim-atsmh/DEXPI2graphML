@@ -324,6 +324,34 @@ def _transform_from_element(element) -> Transform:
 # --------------------------------------------------------------------------- #
 # Pipe network + nozzles (already in world coordinates)
 # --------------------------------------------------------------------------- #
+# DEXPI LINESTYLE (from the source DXF) -> matplotlib linestyle.
+# Mirrors the MicroStation DGN line-style codes (0-7). Dash tuples are
+# (offset, (on, off, ...)) in points.
+#   DGN0 Solid | DGN1 Dotted | DGN2 Medium dashed | DGN3 Long dashed
+#   DGN4 Dot-dash | DGN5 Short dash | DGN6 Dash-double-dot | DGN7 Long-short dash
+_LINESTYLE_MAP = {
+    "Continuous": "-",
+    "DGN0": "-",
+    "DGN1": (0, (1, 2)),
+    "DGN2": (0, (5, 2)),
+    "DGN3": (0, (10, 2)),
+    "DGN4": (0, (1, 2, 6, 2)),
+    "DGN5": (0, (3, 2)),
+    "DGN6": (0, (6, 2, 1, 2, 1, 2)),
+    "DGN7": (0, (10, 2, 3, 2)),
+}
+
+
+def _segment_linestyle(segment) -> str:
+    """matplotlib linestyle for a segment's DEXPI LINESTYLE (default solid)."""
+    attrs = _find_child_local(segment, "GenericAttributes")
+    if attrs is not None:
+        for attr in _find_children_local(attrs, "GenericAttribute"):
+            if attr.get("Name") == "LINESTYLE":
+                return _LINESTYLE_MAP.get(attr.get("Value"), "-")
+    return "-"
+
+
 def _draw_centerline(axis, segment, view_box: ViewBox, pixel_scale: float) -> None:
     center_line = _find_child_local(segment, "CenterLine")
     if center_line is None:
@@ -336,7 +364,9 @@ def _draw_centerline(axis, segment, view_box: ViewBox, pixel_scale: float) -> No
         [_to_canvas_y(y, view_box, pixel_scale) for _, y in points],
         color="#000000",
         linewidth=LINE_WIDTH,
+        linestyle=_segment_linestyle(segment),
         solid_capstyle="round",
+        dash_capstyle="round",
         zorder=1,
     )
 
