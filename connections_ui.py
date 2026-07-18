@@ -41,9 +41,48 @@ def save_last_path(path: str) -> None:
         pass
 
 
+# ID -> display name, rebuilt when the active file changes. `see_connections`'
+# get_name only covers top-level PipingComponent; this also resolves
+# ProcessInstrumentationFunction instruments (C-043, C-046, ...) and the JN-*
+# junction Nodes under PipingNetworkSystem, which otherwise show "no name".
+_name_map = {}
+_name_map_path = None  # path the map was built for; rebuild when it changes
+
+
+def _build_name_map() -> dict[str, str]:
+    """(Re)build the ID->name map for the currently loaded XML."""
+    global _name_map, _name_map_path
+    if sc.root is None:
+        return {}
+    if _name_map_path == sc.XML_PATH and _name_map:
+        return _name_map
+
+    mapping: dict[str, str] = {}
+    for element in sc.root.iter():
+        el_id = element.get("ID")
+        if not el_id or el_id in mapping:
+            continue
+        tag = element.tag.rsplit("}", 1)[-1]  # tolerate a namespace if present
+        if tag in ("PipingComponent", "ProcessInstrumentationFunction"):
+            name = element.get("ComponentName") or element.get("TagName")
+            if name:
+                mapping[el_id] = name
+        elif tag == "Node" and el_id.startswith("JN"):
+            mapping[el_id] = "Junction"
+
+    _name_map = mapping
+    _name_map_path = sc.XML_PATH
+    return mapping
+
+
+def _resolve_name(conn_id: str) -> str:
+    """Name for any connection endpoint (component, instrument, or junction)."""
+    return _build_name_map().get(conn_id, "")
+
+
 def _format(conn_id: str) -> str:
     """`C-050` -> `C-050: PV` (name omitted when unknown)."""
-    name = sc.get_name(conn_id)
+    name = _resolve_name(conn_id)
     return f"{conn_id}: {name}" if name else conn_id
 
 
@@ -100,7 +139,7 @@ def show_connections() -> None:
         status.set("Enter a component ID.")
         return
 
-    name = sc.get_name(comp_id)
+    name = _resolve_name(comp_id)
     comp_name_var.set(name if name else "(no name found)")
 
     before = [_format(c.attrib["FromID"]) for c in sc.get_from_of(comp_id)]
